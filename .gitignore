@@ -1,0 +1,27 @@
+# python缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE配置
+.idea/
+.vscode/
+
+# 实验输出日志结果
+logs/
+analysis/
+
+# 预训练权重、大模型文件
+pretrain_model/
+*.npz
+*.pt
+*.pth
+
+# 数据集
+local_datasets/
+
+# 压缩包
+*.zip
+*.tar.gz
+*.rar
