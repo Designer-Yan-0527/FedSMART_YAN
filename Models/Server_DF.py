@@ -100,13 +100,6 @@ class Server_DF(object):
         self.test_data = test_data
         self.args = args
 
-        # ---- 方案1: EMA Prototype + Quality Weight ----
-        self.use_ema_proto = getattr(args, 'use_ema_proto', False)
-        self.ema_momentum = getattr(args, 'ema_momentum', 0.9)
-        self.use_quality_weight = getattr(args, 'use_quality_weight', False)
-        self.quality_lambda = getattr(args, 'quality_lambda', 0.1)
-        # -------------------------------------------------
-
         # Task tracking
         self.task_id = -1
 
@@ -379,17 +372,6 @@ class Server_DF(object):
                             this_round[label] = [self.clients[i].local_protos[label]]
 
         # 收集每个类别的样本数量（用于 Quality-Weighted Prototype Selection）
-        sample_counts = {}
-        if self.use_quality_weight:
-            for i in self.thisclients:
-                if hasattr(self.clients[i], 'class_sample_counts'):
-                    for label, count in self.clients[i].class_sample_counts.items():
-                        if label not in self.fix_keys:
-                            if label in sample_counts:
-                                sample_counts[label].append(count)
-                            else:
-                                sample_counts[label] = [count]
-
         # Determine which keys to process
         if len(this_round.keys()) != 0 and self.fix_keys != []:
             keys = list(this_round.keys())
@@ -459,18 +441,7 @@ class Server_DF(object):
                 chose = None
                 for h in range(low_bound, high_bound):
                     aver_simi = torch.mean(adj_matrix[h])
-                    if self.use_quality_weight and keys[j] in sample_counts:
-                        # 质量加权：样本量越大的原型得分越低（越好）
-                        proto_idx_in_class = h - low_bound
-                        if proto_idx_in_class < len(sample_counts[keys[j]]):
-                            n_samples = sample_counts[keys[j]][proto_idx_in_class]
-                            # 组合得分 = 判别性 - λ × log(样本量)
-                            # 样本越多 → 得分越低 → 更容易被选中
-                            score = aver_simi - self.quality_lambda * np.log(max(n_samples, 1))
-                        else:
-                            score = aver_simi
-                    else:
-                        score = aver_simi
+                    score = aver_simi
                     if score < min_sim:
                         min_sim = aver_simi
                         chose = h
@@ -478,14 +449,7 @@ class Server_DF(object):
                     self.fix_keys.append(keys[j])
                 map[keys[j]] = min_sim
                 new_proto = matrix[chose].cpu()
-                # EMA 原型更新（方案1）：平滑融合新旧原型
-                if self.use_ema_proto and keys[j] in global_protos:
-                    global_protos[keys[j]] = (
-                        self.ema_momentum * global_protos[keys[j]]
-                        + (1 - self.ema_momentum) * new_proto
-                    )
-                else:
-                    global_protos[keys[j]] = new_proto
+                global_protos[keys[j]] = new_proto
                 low_bound = high_bound
             else:
                 high_bound = low_bound + num[j]

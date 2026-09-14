@@ -43,7 +43,7 @@ class Tail_Anchor(nn.Module):
     def __init__(self, anchor_size, key_size, nb_class,
                  soft_anchor=True, soft_temperature=0.1,
                  top_k_anchor=None, temperature_anneal=False,
-                 use_sparse_softmax=False, fisher_ema_decay=0.9):
+                 use_sparse_softmax=False):
         """
         初始化 Tail_Anchor 模型
 
@@ -56,7 +56,6 @@ class Tail_Anchor(nn.Module):
             top_k_anchor: Top-K 稀疏 softmax 的 K 值，None 表示使用全部 anchor
             temperature_anneal: 是否启用温度退火
             use_sparse_softmax: 是否启用 Top-K 稀疏 softmax
-            fisher_ema_decay: Fisher 信息累积的 EMA 衰减系数
         """
         super(Tail_Anchor, self).__init__()
         self.size = anchor_size
@@ -69,7 +68,6 @@ class Tail_Anchor(nn.Module):
         self.top_k_anchor = top_k_anchor
         self.temperature_anneal = temperature_anneal
         self.use_sparse_softmax = use_sparse_softmax
-        self.fisher_ema_decay = fisher_ema_decay
 
         # 温度退火范围
         self.temp_min = 0.03
@@ -85,9 +83,6 @@ class Tail_Anchor(nn.Module):
         self.head = Chead(200)
         anchor_pool_size = (nb_class, key_size)
         self.anchor_pool = nn.Parameter(torch.randn(anchor_pool_size))
-
-        # Fisher 信息累积（用于 Fisher-Weighted Temporal Stability）
-        self.register_buffer('anchor_fisher', torch.zeros(anchor_pool_size))
 
     def l2_normalize(self, x, dim=None, epsilon=1e-12):
         """
@@ -182,6 +177,10 @@ class Tail_Anchor(nn.Module):
             # 加权组合 anchor 特征 (B,Pool) @ (Pool,C) -> (B, C)
             anchor_feat = torch.matmul(attn_weights, anchor_norm)
 
+            # 累积 anchor 使用频率（用于置信度加权的时序稳定性）
+            batch_usage = attn_weights.sum(dim=0).detach()  # (Pool_size,)
+            self.anchor_usage += batch_usage.to(self.anchor_usage.device)
+
             # 拉约束损失：加权后的 feature 与加权后的 key-feature 对齐
             reduce_sim = torch.sum(
                 x_embed_norm * torch.matmul(attn_weights, key_norm_dev)
@@ -198,6 +197,10 @@ class Tail_Anchor(nn.Module):
                 similarity.shape[0], similarity.shape[1], device=x.device
             )
             attn_weights.scatter_(1, index, 1.0)
+
+            # 累积 anchor 使用频率（用于置信度加权的时序稳定性）
+            batch_usage = attn_weights.sum(dim=0).detach()  # hard: 只有被选中的 anchor 计数+1
+            self.anchor_usage += batch_usage.to(self.anchor_usage.device)
 
             batched_key_norm = key_norm_dev[index]
             x_embed_norm_u = x_embed_norm.unsqueeze(1)  # B, 1, C
@@ -243,37 +246,6 @@ class Tail_Anchor(nn.Module):
     def reset_anchor_usage(self):
         """重置 anchor 使用频率统计"""
         self.anchor_usage.zero_()
-
-    def accumulate_fisher(self):
-        """
-        Fisher-Weighted Temporal Stability:
-        累积 anchor_pool 梯度的平方作为 Fisher 信息的近似估计。
-
-        F(θ) ≈ EMA( (∂L/∂θ)² )
-        """
-        if self.anchor_pool.grad is not None:
-            grad_sq = self.anchor_pool.grad.detach() ** 2
-            self.anchor_fisher = (
-                self.fisher_ema_decay * self.anchor_fisher
-                + (1 - self.fisher_ema_decay) * grad_sq
-            )
-
-    def get_anchor_fisher(self):
-        """
-        获取归一化后的 Fisher 权重。
-
-        Returns:
-            fisher: 归一化到 [0, 1] 的 Fisher 信息矩阵
-        """
-        fisher = self.anchor_fisher.clone()
-        max_val = fisher.max()
-        if max_val > 0:
-            fisher = fisher / max_val
-        return fisher
-
-    def reset_anchor_fisher(self):
-        """重置 Fisher 信息累积"""
-        self.anchor_fisher.zero_()
 
     def load_head(self, head):
         """

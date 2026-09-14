@@ -1,33 +1,51 @@
-# FedSMR 运行命令
+# FedSMR 实验运行命令
 
-本文档提供 **FedSMR (Federated Soft Memory Retrieval)** 论文方案的运行命令。
+本文档提供 **FedSMR (Federated Soft Memory Retrieval)** 论文的完整实验命令。
 
-## 核心改进（FedSMR）
+---
 
-| 改进 | 说明 | 默认值 |
-|------|------|--------|
-| **Unified Soft Memory Retrieval** | Prompt 和 Anchor 均使用 softmax 加权选择 | 启用 |
-| **Memory Structure Preservation (MSP)** | 三层正则化：多样性 + 一致性 + 时序稳定性 | 需显式启用 |
-| **Temperature Annealing** | 训练中温度从高到低余弦退火 | 可选 |
-| **Top-K Sparse Softmax** | 仅 top-k anchor 参与 softmax，减少噪声 | 可选 |
-| **Usage-Weighted Aggregation** | 联邦聚合基于记忆使用频率加权 | 可选 |
+## 实验方案总览
 
-## 通用参数说明
+```
+基线: 原始 FedTA（Hard Selection）
+  │
+  ├── A: Soft-Anchor（软锚选择）
+  │
+  └── A+B: Soft-Anchor + MSP 三重约束（FedSMR 核心）
+            │
+            ├── 适应性多样性约束（anchor_diversity）
+            ├── 自适应一致性约束（coherence，按公共类占比缩放）
+            └── 置信度加权时序稳定性（temporal，按 anchor 使用频率加权）
+```
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--model` | vit_base_patch16_224 | ViT 模型架构 |
-| `--batch-size` | 16 | 训练批次大小 |
+| 编号 | 配置 | 说明 |
+|------|------|------|
+| 0 | 基线 | 原始 FedTA（Hard Anchor + Hard Prompt） |
+| A | Soft-Anchor | 余弦相似度 + softmax 加权所有 anchor |
+| A+B | + aMSP | 自适应三层正则化（多样性 + 一致性 + 时序稳定性） |
+
+---
+
+## 通用参数
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `--model` | vit_base_patch16_224 | ViT-B/16 预训练模型 |
+| `--batch-size` | 16 | 批次大小（所有实验统一） |
 | `--data-path` | local_datasets/ | 数据集路径 |
-| `--output_dir` | ./output | 输出目录 |
 | `--client_num` | 5 | 客户端数量 |
-| `--task_num` | 5 | 任务数量 |
-| `--global_epoch` | 5 | 全局轮次数 |
-| `--local_epoch` | 30 | 本地轮次数 |
+| `--task_num` | 5 | 每个客户端任务数 |
+| `--private_class_num` | 15 | 每客户端私有类别数 |
+| `--global_epoch` | 5 | 全局通信轮数 |
+| `--local_epoch` | 30 | 本地训练轮数 |
+| `--surrogate_num` | 20 | 服务器代理数据每类样本数 |
+| `--seed` | 42 | 随机种子（建议跑 3 个 seed：42, 123, 2024） |
+
+---
 
 ## 一、CIFAR-100 数据集
 
-### 1.1 Baseline（原 FedTA）
+### 0. 基线 — 原始 FedTA（Hard Selection）
 
 ```bash
 python main.py cifar100_delay \
@@ -45,43 +63,26 @@ python main.py cifar100_delay \
   --use_msp=False
 ```
 
-### 1.2 FedA（Soft Anchor）
+### A. Soft-Anchor（FedA）
 
 ```bash
 python main.py cifar100_delay \
   --model vit_base_patch16_224 \
   --batch-size 16 \
   --data-path local_datasets/ \
-  --output_dir ./output/cifar100_fedsmr \
+  --output_dir ./output/cifar100_soft_anchor \
   --data_name cifar100 \
   --client_num 5 \
   --task_num 5 \
   --global_epoch 5 \
   --local_epoch 30 \
   --use_soft_anchor=True \
-  --soft_temperature=0.17
-```
-
-### 1.3 FedAP（Soft Anchor + Soft Prompt）效果不好不开启
-
-```bash
-python main.py cifar100_delay \
-  --model vit_base_patch16_224 \
-  --batch-size 16 \
-  --data-path local_datasets/ \
-  --output_dir ./output/cifar100_fedsmr \
-  --data_name cifar100 \
-  --client_num 5 \
-  --task_num 5 \
-  --global_epoch 5 \
-  --local_epoch 30 \
-  --use_soft_anchor=True \
-  --soft_temperature=0.1 \
+  --soft_temperature=0.17 \
   --use_soft_prompt=False \
-  --prompt_temperature=0.1
+  --use_msp=False
 ```
 
-### 1.4 FedSMR（默认配置：Soft Anchor + MSP）
+### A+B. Soft-Anchor + MSP 三重约束（FedSMR 核心）
 
 ```bash
 python main.py cifar100_delay \
@@ -103,123 +104,11 @@ python main.py cifar100_delay \
   --msp_temporal_coeff=0.1
 ```
 
-### 1.5 FedSMR + Top-K Sparse Softmax
-
-```bash
-python main.py cifar100_delay \
-  --model vit_base_patch16_224 \
-  --batch-size 16 \
-  --data-path local_datasets/ \
-  --output_dir ./output/cifar100_fedsmr_sparse \
-  --data_name cifar100 \
-  --client_num 5 \
-  --task_num 5 \
-  --global_epoch 5 \
-  --local_epoch 30 \
-  --use_soft_anchor=True \
-  --soft_temperature=0.1 \
-  --use_soft_prompt=False \
-  --use_sparse_softmax=True \
-  --top_k_anchor=5 \
-  --use_msp=True \
-  --msp_diversity_coeff=0.1 \
-  --msp_coherence_coeff=0.1 \
-  --msp_temporal_coeff=0.1
-```
-
-### 1.5.1 FedSMR + Top-K Sparse Softmax + Temperature Annealing
-
-```bash
-python main.py cifar100_delay \
-  --model vit_base_patch16_224 \
-  --batch-size 16 \
-  --data-path local_datasets/ \
-  --output_dir ./output/cifar100_fedsmr_sparse \
-  --data_name cifar100 \
-  --client_num 5 \
-  --task_num 5 \
-  --global_epoch 5 \
-  --local_epoch 30 \
-  --use_soft_anchor=True \
-  --soft_temperature=0.1 \
-  --use_soft_prompt=False \
-  --use_sparse_softmax=True \
-  --use_msp=True \
-  --msp_diversity_coeff=0.1 \
-  --msp_coherence_coeff=0.1 \
-  --msp_temporal_coeff=0.1 \
-  --temperature_anneal=True
-```
-
-### 1.6 FedSMR + Temperature Annealing
-
-```bash
-python main.py cifar100_delay \
-  --model vit_base_patch16_224 \
-  --batch-size 16 \
-  --data-path local_datasets/ \
-  --output_dir ./output/cifar100_fedsmr_anneal \
-  --data_name cifar100 \
-  --client_num 5 \
-  --task_num 5 \
-  --global_epoch 5 \
-  --local_epoch 30 \
-  --use_soft_anchor=True \
-  --temperature_anneal=True \
-  --use_soft_prompt=False \
-  --use_msp=True
-```
-
-### 1.7 FedSMR + Usage-Weighted Aggregation
-
-```bash
-python main.py cifar100_delay \
-  --model vit_base_patch16_224 \
-  --batch-size 16 \
-  --data-path local_datasets/ \
-  --output_dir ./output/cifar100_fedsmr_agg \
-  --data_name cifar100 \
-  --client_num 5 \
-  --task_num 5 \
-  --global_epoch 5 \
-  --local_epoch 30 \
-  --use_soft_anchor=True \
-  --use_soft_prompt=False \
-  --use_msp=True \
-  --use_fed_smr_aggregate=True
-```
-
-### 1.8 FedSMR + EMA Prototype + Quality Weight + Fisher Temporal（方案1+2 组合）
-
-```bash
-python main.py cifar100_delay \
-  --model vit_base_patch16_224 \
-  --batch-size 16 \
-  --data-path local_datasets/ \
-  --output_dir ./output/cifar100_fedsmr_v2 \
-  --data_name cifar100 \
-  --client_num 5 \
-  --task_num 5 \
-  --global_epoch 5 \
-  --local_epoch 30 \
-  --use_soft_anchor=True \
-  --soft_temperature=0.17 \
-  --use_soft_prompt=False \
-  --use_msp=True \
-  --msp_diversity_coeff=0.1 \
-  --msp_coherence_coeff=0.1 \
-  --msp_temporal_coeff=0.1 \
-  --use_ema_proto=True \
-  --ema_momentum=0.9 \
-  --use_quality_weight=True \
-  --quality_lambda=0.1 \
-  --use_fisher_temporal=True \
-  --fisher_ema_decay=0.9
-```
+---
 
 ## 二、ImageNet-R 数据集
 
-### 2.1 Baseline（原 FedTA）
+### 0. 基线 — 原始 FedTA（Hard Selection）
 
 ```bash
 python main.py imagenet_r_delay \
@@ -237,43 +126,26 @@ python main.py imagenet_r_delay \
   --use_msp=False
 ```
 
-### 2.2 FedA（Soft Anchor）
+### A. Soft-Anchor（FedA）
 
 ```bash
 python main.py imagenet_r_delay \
   --model vit_base_patch16_224 \
   --batch-size 16 \
   --data-path local_datasets/ \
-  --output_dir ./output/imagenet_r_fedsmr \
+  --output_dir ./output/imagenet_r_soft_anchor \
   --data_name ImageNet-R \
   --client_num 5 \
   --task_num 5 \
   --global_epoch 5 \
   --local_epoch 30 \
   --use_soft_anchor=True \
-  --soft_temperature=0.17
-```
-
-### 2.3 FedAP（Soft Anchor + Soft Prompt）
-
-```bash
-python main.py imagenet_r_delay \
-  --model vit_base_patch16_224 \
-  --batch-size 16 \
-  --data-path local_datasets/ \
-  --output_dir ./output/imagenet_r_fedsmr \
-  --data_name ImageNet-R \
-  --client_num 5 \
-  --task_num 5 \
-  --global_epoch 5 \
-  --local_epoch 30 \
-  --use_soft_anchor=True \
-  --soft_temperature=0.1 \
+  --soft_temperature=0.17 \
   --use_soft_prompt=False \
-  --prompt_temperature=0.1
+  --use_msp=False
 ```
 
-### 2.4 FedSMR（默认配置）
+### A+B. Soft-Anchor + MSP 三重约束（FedSMR 核心）
 
 ```bash
 python main.py imagenet_r_delay \
@@ -289,160 +161,168 @@ python main.py imagenet_r_delay \
   --use_soft_anchor=True \
   --soft_temperature=0.17 \
   --use_soft_prompt=False \
-  --prompt_temperature=0.1 \
   --use_msp=True \
-  --msp_diversity_coeff=0.11 \
+  --msp_diversity_coeff=0.1 \
   --msp_coherence_coeff=0.1 \
   --msp_temporal_coeff=0.1
 ```
 
-### 2.5 FedSMR + Top-K Sparse Softmax
+---
+
+## 三、消融实验（MSP 三组件拆分）
+
+> 仅需在 CIFAR-100 上跑，验证 MSP 三个正则化项各自的贡献。
+
+### 去掉 Diversity Loss
 
 ```bash
-python main.py imagenet_r_delay \
+python main.py cifar100_delay \
   --model vit_base_patch16_224 \
   --batch-size 16 \
   --data-path local_datasets/ \
-  --output_dir ./output/imagenet_r_fedsmr_sparse \
-  --data_name ImageNet-R \
-  --client_num 5 \
-  --task_num 5 \
-  --global_epoch 5 \
-  --local_epoch 30 \
-  --use_soft_anchor=True \
+  --output_dir ./output/cifar100_ablation_no_div \
+  --data_name cifar100 \
+  --client_num 5 --task_num 5 --global_epoch 5 --local_epoch 30 \
+  --use_soft_anchor=True --soft_temperature=0.17 \
   --use_soft_prompt=False \
-  --use_sparse_softmax=True \
-  --top_k_anchor=10 \
-  --use_msp=True
+  --use_msp=True \
+  --msp_diversity_coeff=0.0 \
+  --msp_coherence_coeff=0.1 \
+  --msp_temporal_coeff=0.1
 ```
 
-## 三、参数说明
+### 去掉 Coherence Loss
 
-### 3.1 FedSMR 核心参数
+```bash
+python main.py cifar100_delay \
+  --model vit_base_patch16_224 \
+  --batch-size 16 \
+  --data-path local_datasets/ \
+  --output_dir ./output/cifar100_ablation_no_coh \
+  --data_name cifar100 \
+  --client_num 5 --task_num 5 --global_epoch 5 --local_epoch 30 \
+  --use_soft_anchor=True --soft_temperature=0.17 \
+  --use_soft_prompt=False \
+  --use_msp=True \
+  --msp_diversity_coeff=0.1 \
+  --msp_coherence_coeff=0.0 \
+  --msp_temporal_coeff=0.1
+```
 
-| 开关 | 默认值 | 效果 |
-|------|--------|------|
-| `--use_soft_anchor` | True | **Soft Anchor Mixture**：cosine sim + softmax 加权所有 anchor |
-| `--soft_temperature` | 0.1 | Anchor softmax 温度，越大越平滑，建议 [0.05, 0.5] |
-| `--use_soft_prompt` | True | **Soft Prompt Retrieval**：prompt 侧 softmax 加权选择 |
-| `--prompt_temperature` | 0.1 | Prompt softmax 温度，建议 [0.05, 0.5] |
-| `--use_msp` | False | **MSP 三层正则化**：多样性 + 一致性 + 时序稳定性 |
-| `--msp_diversity_coeff` | 0.1 | Intra-Pool Diversity 权重 |
-| `--msp_coherence_coeff` | 0.1 | Cross-Pool Coherence 权重 |
-| `--msp_temporal_coeff` | 0.1 | Temporal Stability 权重 |
+### 去掉 Temporal Stability Loss
 
-### 3.2 FedSMR 可选增强
+```bash
+python main.py cifar100_delay \
+  --model vit_base_patch16_224 \
+  --batch-size 16 \
+  --data-path local_datasets/ \
+  --output_dir ./output/cifar100_ablation_no_tmp \
+  --data_name cifar100 \
+  --client_num 5 --task_num 5 --global_epoch 5 --local_epoch 30 \
+  --use_soft_anchor=True --soft_temperature=0.17 \
+  --use_soft_prompt=False \
+  --use_msp=True \
+  --msp_diversity_coeff=0.1 \
+  --msp_coherence_coeff=0.1 \
+  --msp_temporal_coeff=0.0
+```
 
-| 开关 | 默认值 | 效果 |
-|------|--------|------|
-| `--use_sparse_softmax` | False | 仅 top-k anchor 参与 softmax，减少噪声 |
-| `--top_k_anchor` | None | Top-K 的 K 值，None = 使用全部 |
-| `--temperature_anneal` | False | 温度余弦退火，训练中从高到低 |
-| `--use_fed_smr_aggregate` | False | 基于使用频率的联邦加权聚合 |
+---
 
-### 3.3 EMA Prototype Update（方案1：原型平滑更新）
+## 四、参数速查
 
-| 开关 | 默认值 | 效果 |
-|------|--------|------|
-| `--use_ema_proto` | False | **EMA 原型更新**：指数移动平均平滑全局原型，防止剧烈波动 |
-| `--ema_momentum` | 0.9 | EMA 动量系数，越大越平滑，建议 [0.8, 0.99] |
+### 核心模块开关
 
-### 3.4 Quality-Weighted Prototype Selection（方案1：质量加权选择）
+| 模块 | 参数 | 默认值 | 说明 |
+|------|------|--------|------|
+| Soft-Anchor | `--use_soft_anchor` | False | 余弦相似度 + softmax 加权所有 anchor |
+| Soft-Anchor 温度 | `--soft_temperature` | 0.1 | 越小越接近 hard，CIFAR-100 用 0.17 |
+| MSP 总开关 | `--use_msp` | False | 三层自适应正则化 |
+| MSP 多样性 | `--msp_diversity_coeff` | 0.1 | Intra-Pool Diversity 权重 |
+| MSP 一致性 | `--msp_coherence_coeff` | 0.1 | Cross-Pool Coherence 权重（自适应缩放） |
+| MSP 时序 | `--msp_temporal_coeff` | 0.1 | Temporal Stability 权重（置信度加权） |
 
-| 开关 | 默认值 | 效果 |
-|------|--------|------|
-| `--use_quality_weight` | False | **原型质量加权**：样本量越大的原型权重越高，优先选择可靠原型 |
-| `--quality_lambda` | 0.1 | 样本量对选择的影响强度，建议 [0.01, 0.5] |
+### 自适应行为
 
-### 3.5 Fisher-Weighted Temporal Stability（方案2：重要记忆保护）
+| 机制 | CIFAR-100 (有公共类) | ImageNet-R (无公共类) |
+|------|---------------------|---------------------|
+| Coherence 开关 | 启用（|Cp\|=25 > 0） | 禁用（|Cp\|=0） |
+| Temporal 加权 | 高频 anchor 强约束 | 全域低使用频率，弱约束 |
 
-| 开关 | 默认值 | 效果 |
-|------|--------|------|
-| `--use_fisher_temporal` | False | **Fisher 加权时序稳定性**：重要 anchor 变化时惩罚更重，保护关键记忆 |
-| `--fisher_ema_decay` | 0.9 | Fisher 信息累积的 EMA 衰减系数，建议 [0.8, 0.99] |
+### 暂不使用的参数
 
-### 3.6 原始 FedTA 参数
+| 参数 | 说明 |
+|------|------|
+| `--use_soft_prompt` | Soft Prompt Retrieval，效果不佳，不启用 |
+| `--use_sparse_softmax` | Top-K 稀疏 Softmax，可选增强 |
+| `--temperature_anneal` | 温度退火，可选增强 |
+| `--use_fed_smr_aggregate` | 使用频率联邦加权聚合，可选增强 |
 
-| 开关 | 默认值 | 效果 |
-|------|--------|------|
-| `--lambda_spatial` | 1.0 | Tail Anchor pull-off 约束强度 |
-| `--lambda_sikf` | 1.0 | InfoNCE 对比学习强度 |
+---
 
-## 四、FedSMR 损失函数结构
+## 五、损失函数结构
 
 ```
-loss = CE_loss
-     + lambda_spatial * (-0.1 * pull_off)                     # 空间分支
-     + lambda_sikf * (0.2 * task_per_global_epoch * loss_infonce)  # SIKF 分支
-     + msp_diversity_coeff * L_anchor_div                     # MSP: Anchor 多样性
-     + msp_coherence_coeff * L_coherence                      # MSP: Prompt-Anchor 一致性
-     + msp_temporal_coeff * L_temporal                        # MSP: 时序稳定性
+L_total = L_CE
+        + λ_spatial · (-0.1 · L_pull_off)              # 空间分支（Tail Anchor）
+        + λ_sikf · (0.2 · t · L_infonce)               # SIKF 对比学习分支
+        + α_div · L_anchor_div                          # MSP: Anchor 多样性
+        + α_coh · r_pub · L_coherence                   # MSP: 自适应一致性
+        + α_tmp · Σ conf_i · MSE(anchor_i^t, anchor_i^{t-1})  # MSP: 置信度加权时序
 ```
 
 其中：
-- **L_anchor_div** = abs(cosine(anchor_i, anchor_j)) 的均值，约束 anchor 间保持多样性
-- **L_coherence** = clamp(cos(F_prompt, F_anchor))，约束 prompt 与 anchor 特征保持合理范围
-- **L_temporal** = MSE(anchor_t, anchor_{t-1})，约束 anchor 跨轮次平滑更新
+- **L_anchor_div** = `max(0, cos(anchor_i, anchor_j))` 的均值，约束 anchor 间保持多样性
+- **L_coherence** = `max(0, 0.3-cos) + max(0, cos-0.7)`，区间约束，仅在有关公共类时生效
+- **r_pub** = `|Cp| / |C|`，公共类占比（CIFAR-100: 0.25, ImageNet-R: 0）自动缩放 coherence
+- **L_temporal** = 置信度加权 MSE，`conf_i = usage_i / max(usage)`，使用频率高→强约束
 
-## 五、消融实验建议
+---
 
-### 5.1 推荐消融顺序
+## 六、建议执行顺序
 
-1. **Step 1**：Baseline（`--use_soft_anchor=False --use_soft_prompt=False --use_msp=False`）
-2. **Step 2**：+ Soft Anchor（`--use_soft_anchor=True`）
-3. **Step 3**：+ Soft Prompt（`--use_soft_prompt=True`）
-4. **Step 4**：+ MSP（`--use_msp=True`）
-5. **Step 5**：+ Sparse Softmax（`--use_sparse_softmax=True --top_k_anchor=10`）
-6. **Step 6**：+ Temperature Annealing（`--temperature_anneal=True`）
-7. **Step 7**：+ Usage-Weighted Aggregation（`--use_fed_smr_aggregate=True`）
+```
+第一优先级（核心对比）:
+  ├── 0. 基线 (CIFAR-100 + ImageNet-R)
+  ├── A. Soft-Anchor (CIFAR-100 + ImageNet-R)
+  ├── A+B. FedSMR + aMSP (CIFAR-100 + ImageNet-R)
+  └── 每个跑 3 个 seed (42, 123, 2024)
 
-### 5.2 超参调整建议
+第二优先级（消融）:
+  ├── MSP 三组件拆分 (CIFAR-100)
+  └── 温度 τ 敏感性分析 (CIFAR-100: τ ∈ {0.05, 0.1, 0.17, 0.3, 0.5})
 
-| 参数 | 建议范围 | 备注                                      |
-|------|----------|-----------------------------------------|
-| `--soft_temperature` | [0.05, 0.5] | 越小越接近 hard selection，越大越平滑，目前测试0.17效果最好 |
-| `--prompt_temperature` | [0.05, 0.5] | 同上，效果不好不启用                              |
-| `--msp_diversity_coeff` | [0.05, 0.5] | 越大越强调 anchor 多样性                        |
-| `--msp_coherence_coeff` | [0.05, 0.5] | 越大越强调 prompt-anchor 一致性                 |
-| `--msp_temporal_coeff` | [0.05, 0.5] | 越大越强调跨轮次稳定性                             |
-| `--top_k_anchor` | [5, 20] | 取决于类别数量，建议 nb_class/2                   |
+第三优先级（超参调优）:
+  ├── msp_diversity_coeff ∈ {0.05, 0.1, 0.2}
+  └── msp_temporal_coeff ∈ {0.05, 0.1, 0.2}
+```
 
-### 5.3 预期效果
+---
 
-- **Accuracy ↑**：Unified Soft Memory Retrieval 提供更稳定、更丰富的梯度信号
-- **Catastrophic Forgetting ↓**：MSP 三层正则化约束记忆结构保持
-- **Communication Efficiency ↑**：Usage-Weighted Aggregation 高效传递共识信息
+## 七、技术原理
 
-## 六、FedSMR 技术原理
-
-### 6.1 Unified Soft Memory Retrieval
+### 7.1 Soft-Anchor（A）
 
 ```
 # Hard Selection（原始 FedTA）
-anchor = anchor_pool[topk(similarity, k=1)]  # 只选一个
-prompt = prompt_pool[topk(similarity, k=top_k)]  # 只选 top_k 个
+anchor = anchor_pool[argmax(similarity)]
 
-# Soft Memory Retrieval（FedSMR）
-weights_anchor = softmax(similarity / temperature_anchor)
-anchor = sum(weights_anchor[i] * anchor_pool[i])  # 加权所有 anchor
-
-weights_prompt = softmax(similarity / temperature_prompt)
-prompt = sum(weights_prompt[i] * prompt_pool[i])  # 加权所有 prompt
+# Soft-Anchor
+weights = softmax(cosine_similarity(query, anchors) / temperature)
+anchor = Σ(weights[i] · anchor_pool[i])
 ```
 
-### 6.2 Memory Structure Preservation (MSP)
+### 7.2 自适应 MSP 三重约束（B）
 
 ```
-L_ms = L_diversity + L_coherence + L_temporal
+L_ms = L_diversity + r_pub · L_coherence + Σ conf_i · L_temporal_i
 
-L_diversity = mean(abs(cos(anchor_i, anchor_j)))  # Intra-Pool
-L_coherence = clamp(cos(F_prompt, F_anchor), 0.3, 0.7)  # Cross-Pool
-L_temporal = MSE(anchor_t, anchor_{t-1})  # Temporal
+L_diversity  = max(0, cos(anchor_i, anchor_j))      # 只惩罚正相似度
+L_coherence  = max(0, l-cos) + max(0, cos-u)         # 区间 [l, u] 内不惩罚
+r_pub         = |Cp| / |C|                             # 自适应缩放（无公共类→禁能）
+conf_i        = usage_i / max(usage)                   # 置信度加权（高频→强约束）
+L_temporal_i = (anchor_i^t - anchor_i^{t-1})²         # 按 anchor 置信度加权
 ```
 
-### 6.3 Usage-Weighted Federation Aggregation
-
-```
-w_i = usage_i / sum(usage)  # 使用频率归一化权重
-anchor_global = sum(w_i * anchor_i)  # 高频向量获得更高权重
-```
+- **CIFAR-100**（有公共类、数据充足）：三项全效，A+B > A
+- **ImageNet-R**（无公共类、数据稀疏）：coherence 自动禁用，temporal 自动减弱

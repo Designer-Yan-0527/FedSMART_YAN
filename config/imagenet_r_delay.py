@@ -172,20 +172,4 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--use_fed_smr_aggregate', default=False, type=lambda x: (str(x).lower() == 'true'),
                             help='是否启用基于使用频率的联邦加权聚合')
 
-    # ===== EMA Prototype Update（方案1） =====
-    subparsers.add_argument('--use_ema_proto', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='是否启用 EMA 原型更新（指数移动平均平滑全局原型）')
-    subparsers.add_argument('--ema_momentum', default=0.9, type=float,
-                            help='EMA 动量系数，越大越平滑，建议 [0.8, 0.99]')
-
-    # ===== Quality-Weighted Prototype Selection（方案1） =====
-    subparsers.add_argument('--use_quality_weight', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='是否启用原型质量加权（样本量越大的原型权重越高）')
-    subparsers.add_argument('--quality_lambda', default=0.1, type=float,
-                            help='样本量对原型选择的影响强度，建议 [0.01, 0.5]')
-
-    # ===== Fisher-Weighted Temporal Stability（方案2） =====
-    subparsers.add_argument('--use_fisher_temporal', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='是否启用 Fisher 加权的时序稳定性（重要 anchor 更严格约束）')
-    subparsers.add_argument('--fisher_ema_decay', default=0.9, type=float,
-                            help='Fisher 信息累积的 EMA 衰减系数，建议 [0.8, 0.99]')
+    

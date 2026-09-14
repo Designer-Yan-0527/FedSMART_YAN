@@ -97,14 +97,6 @@ class Client_DF:
         self.msp_temporal_coeff = getattr(args, 'msp_temporal_coeff', 0.01)
         # --------------------------------------------------------------------
 
-        # ---- 方案1: EMA Prototype + Quality Weight ----
-        self.use_ema_proto = getattr(args, 'use_ema_proto', False)
-        self.use_quality_weight = getattr(args, 'use_quality_weight', False)
-        # ---- 方案2: Fisher-Weighted Temporal Stability ----
-        self.use_fisher_temporal = getattr(args, 'use_fisher_temporal', False)
-        self.fisher_ema_decay = getattr(args, 'fisher_ema_decay', 0.9)
-        # ----------------------------------------------------
-
         self.model = self._init_local_model(model_name)
 
         # ---- FedSMR: 将 soft prompt 参数传播到 Global_Prompt 模块 ----
@@ -118,8 +110,11 @@ class Client_DF:
         self.prev_prompt = None
         self.prev_prompt_key = None
 
-        # 追踪每个类别的样本数量（用于 Quality-Weighted Prototype Selection）
-        self.class_sample_counts = {}
+        # 自适应 MSP: 是否有公共类（用于 coherence 开关）
+        # |Cp| = nb_classes - client_num * private_class_num
+        total_private = args.client_num * args.private_class_num
+        public_count = max(0, args.nb_classes - total_private)
+        self._has_public_classes = (public_count > 0)  # CIFAR-100: True, ImageNet-R: False
 
         # Initialize class mask based on dataset type
         if args.data_name in ['cifar100', '5datasets', 'ImageNet-R', 'svhn-mnist']:
@@ -162,7 +157,6 @@ class Client_DF:
                 top_k_anchor=self.top_k_anchor,
                 temperature_anneal=self.temperature_anneal,
                 use_sparse_softmax=self.use_sparse_softmax,
-                fisher_ema_decay=self.fisher_ema_decay,
             )
 
     def _init_log_file(self):
@@ -236,12 +230,12 @@ class Client_DF:
 
     def _compute_msp_losses(self, feat_prompt, anchor_feat, round_num):
         """
-        FedSMR: 计算 Memory Structure Preservation 损失
+        FedSMR: 计算 Memory Structure Preservation 损失（自适应版本）
 
         三层正则化：
-        1. Intra-Pool Diversity: 保持 prompt 和 anchor 池内多样性
-        2. Cross-Pool Coherence: 保持 prompt 和 anchor 记忆空间结构一致
-        3. Temporal Stability: 防止记忆在联邦轮次间剧烈变化
+        1. Intra-Pool Diversity:  保持 anchor 池内多样性（所有场景适用）
+        2. Cross-Pool Coherence:  保持 prompt-anchor 一致性（仅在有关公共类时生效）
+        3. Temporal Stability:    置信度加权时序约束（使用频率高→强约束，低→弱约束）
 
         Args:
             feat_prompt: prompt 增强后的特征 (B, C)
@@ -254,13 +248,13 @@ class Client_DF:
         total_msp_loss = torch.tensor(0.0, device=self.device)
 
         # ---- 1. Intra-Pool Diversity ----
+        # 所有场景统一使用，不做自适应
         if hasattr(self.model, 'anchor_diversity_loss'):
             loss_anchor_div = self.model.anchor_diversity_loss()
             total_msp_loss = total_msp_loss + self.msp_diversity_coeff * loss_anchor_div
 
         # Prompt diversity (通过 vit 的 prompt 模块)
         if self.use_soft_prompt and hasattr(self.vit, 'prompt'):
-            # 尝试获取 prompt 模块的多样性损失
             for attr_name in ['prompt', 'e_prompt', 'g_prompt']:
                 if hasattr(self.vit, attr_name):
                     prompt_module = getattr(self.vit, attr_name)
@@ -269,33 +263,43 @@ class Client_DF:
                         total_msp_loss = total_msp_loss + self.msp_diversity_coeff * loss_prompt_div
                         break
 
-        # ---- 2. Cross-Pool Coherence ----
-        # 保持 prompt 特征和 anchor 特征之间的结构一致性（软对齐）
+        # ---- 2. Cross-Pool Coherence（自适应：无公共类时自动禁用） ----
         if feat_prompt is not None and anchor_feat is not None and self.msp_coherence_coeff > 0:
-            f_p_norm = torch.nn.functional.normalize(feat_prompt, p=2, dim=1)
-            f_a_norm = torch.nn.functional.normalize(anchor_feat, p=2, dim=1)
-            # 软对齐：允许一定差异，用 Huber 风格避免过拟合
-            cos_sim = torch.sum(f_p_norm * f_a_norm, dim=1)
-            # 目标：cos_sim 在 [0.3, 0.7] 之间，不过度对齐也不过度分散
-            lower_violation = torch.clamp(0.3 - cos_sim, min=0)
-            upper_violation = torch.clamp(cos_sim - 0.7, min=0)
-            loss_coherence = (lower_violation + upper_violation).mean()
-            total_msp_loss = total_msp_loss + self.msp_coherence_coeff * loss_coherence
+            # |Cp|=0 时禁用 coherence，有公共类时保持原始强度
+            if self._has_public_classes:
+                f_p_norm = torch.nn.functional.normalize(feat_prompt, p=2, dim=1)
+                f_a_norm = torch.nn.functional.normalize(anchor_feat, p=2, dim=1)
+                cos_sim = torch.sum(f_p_norm * f_a_norm, dim=1)
+                # 区间约束: cos 在 [0.3, 0.7] 内不惩罚
+                lower_violation = torch.clamp(0.3 - cos_sim, min=0)
+                upper_violation = torch.clamp(cos_sim - 0.7, min=0)
+                loss_coherence = (lower_violation + upper_violation).mean()
+                total_msp_loss = total_msp_loss + (
+                    self.msp_coherence_coeff * loss_coherence
+                )
 
-        # ---- 3. Temporal Stability ----
+        # ---- 3. Temporal Stability（自适应：置信度加权） ----
         if self.prev_anchor_pool is not None and self.msp_temporal_coeff > 0:
             current_anchor = self.model.anchor_pool.data
-            if self.use_fisher_temporal and hasattr(self.model, 'get_anchor_fisher'):
-                # Fisher-Weighted: 重要 anchor 变化时惩罚更重
-                fisher_weights = self.model.get_anchor_fisher().to(self.device)
-                loss_temporal = (
-                    fisher_weights * (current_anchor - self.prev_anchor_pool.to(self.device)) ** 2
-                ).mean()
+            prev_anchor = self.prev_anchor_pool.to(self.device)
+
+            # 置信度加权: 使用频率高的 anchor → 更可靠的估计 → 更强的时序约束
+            # 使用频率低的 anchor → 噪声大 → 弱约束（允许自适应调整）
+            if hasattr(self.model, 'get_anchor_usage'):
+                usage = self.model.get_anchor_usage().to(self.device)  # (nb_class,)
+                # 归一化到 [0, 1]，避免绝对尺度影响
+                usage_max = usage.max()
+                if usage_max > 0:
+                    confidence = (usage / usage_max).unsqueeze(1)  # (nb_class, 1)
+                else:
+                    confidence = torch.ones_like(current_anchor)
             else:
-                # 原始 MSP: 所有 anchor 统一约束
-                loss_temporal = torch.nn.functional.mse_loss(
-                    current_anchor, self.prev_anchor_pool.to(self.device)
-                )
+                confidence = torch.ones_like(current_anchor)
+
+            # 加权 MSE: 高置信度 anchor → 强约束；低置信度 → 弱约束
+            loss_temporal = (
+                confidence * (current_anchor - prev_anchor) ** 2
+            ).mean()
             total_msp_loss = total_msp_loss + self.msp_temporal_coeff * loss_temporal
 
         return total_msp_loss
@@ -463,11 +467,7 @@ class Client_DF:
                 optimizer.zero_grad()
                 loss.backward()
 
-                # ---- Fisher 累积（方案2: Fisher-Weighted Temporal Stability） ----
-                if self.use_fisher_temporal and hasattr(self.model, 'accumulate_fisher'):
-                    self.model.accumulate_fisher()
-                # ----------------------------------------------------------------
-
+                
                 optimizer.step()
 
                 global_step += 1
@@ -505,8 +505,6 @@ class Client_DF:
                     all_features = feature_list[data_index]
                     proto = all_features.mean(0).cpu().detach().numpy()
                     local_protos[class_index] = proto
-                    # 记录样本数量（用于 Quality-Weighted Prototype Selection）
-                    self.class_sample_counts[class_index] = data_index.shape[0]
 
         self.local_protos = local_protos
         self.heads[self.task_id] = deepcopy(self.model.get_head())
