@@ -109,30 +109,72 @@ class Server_DF(object):
         self.global_protos = None
         self.temp_protos = None
         self.fix_keys = []
-        
+
         # 统一日志文件初始化
         self.log_file = self._init_log_file()
+
+    def _build_log_filename(self):
+        """
+        FedSMR-v2 日志命名规则:
+        - 基线: FedTA_Baseline_{dataset}.csv
+        - A: Anchor_Softmax{T}_gamma{G}_{dataset}.csv
+        - A+B: Anchor_Softmax{T}_gamma{G}_MSP{D}_{T}_{dataset}.csv
+        - 加后缀: _Route, _CA (Class-Aware), _Proto
+        """
+        parts = []
+        dataset = getattr(self.args, 'data_name', 'unknown')
+
+        use_soft = getattr(self.args, 'use_soft_anchor', False)
+        use_msp = getattr(self.args, 'use_msp', False)
+
+        if not use_soft and not use_msp:
+            parts.append('FedTA_Baseline')
+        elif use_soft and not use_msp:
+            temp = getattr(self.args, 'soft_temperature', 0.17)
+            gamma = getattr(self.args, 'soft_anchor_ratio', 0.25)
+            parts.append(f'Anchor_Softmax{temp}_gamma{gamma}')
+        else:
+            temp = getattr(self.args, 'soft_temperature', 0.17)
+            gamma = getattr(self.args, 'soft_anchor_ratio', 0.25)
+            d = getattr(self.args, 'msp_diversity_coeff', 0.03)
+            t = getattr(self.args, 'msp_temporal_coeff', 0.1)
+            kt = getattr(self.args, 'key_temporal_ratio', 0.5)
+            parts.append(f'Anchor_Softmax{temp}_gamma{gamma}_MSP{d}_{t}_kt{kt}')
+
+        # 可选增强后缀
+        if getattr(self.args, 'use_route_loss', False):
+            parts.append('Route')
+        if getattr(self.args, 'use_class_aware_head_agg', False):
+            parts.append('CA')
+        if getattr(self.args, 'use_proto_replay', False):
+            parts.append('Proto')
+        if getattr(self.args, 'use_seen_routing', False):
+            parts.append('SeenRoute')
+        if getattr(self.args, 'use_head_grad_mask', False):
+            parts.append('HeadMask')
+
+        parts.append(dataset)
+        return '_'.join(parts) + '.csv'
 
     def _init_log_file(self):
         """
         初始化统一的日志文件
-        
-        格式: log_YYYY-MM-DD_HH-MM-SS.csv
-        
-        Returns:
-            创建的日志文件路径
+
+        格式: {hyperparams}_seed{seed}_{timestamp}.csv
         """
-        # 使用醒目的时间格式
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        filename = f"log_{timestamp}.csv"
+        base_name = self._build_log_filename()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        seed = getattr(self.args, 'seed', 42)
+        stem = base_name.replace('.csv', '')
+        filename = f"{stem}_seed{seed}_{timestamp}.csv"
         filepath = os.path.join("logs", filename)
-        
+
         os.makedirs("logs", exist_ok=True)
-        
+
         with open(filepath, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(['Time', 'Round', 'Task_id', 'Client_id', 'Accuracy', 'Notes', 'Phase'])
-        
+
         print(f"日志文件已创建: {filepath}")
         return filepath
 
@@ -285,7 +327,7 @@ class Server_DF(object):
             # Select best prototypes using greedy similarity matching
             self.choose_best_proto_greedy_similarity_fixed_key(
                 (i + 2) % self.global_epoch == 0,
-                threshold=0.25,
+                threshold=self.threshold,
                 round=i
             )
 
@@ -407,15 +449,21 @@ class Server_DF(object):
                     matrix = np.concatenate([matrix, this_round[keys[i]]])
 
                 if keys[i] in global_protos.keys():
-                    matrix = np.concatenate([matrix, global_protos[keys[i]].unsqueeze(0)])
+                    proto = global_protos[keys[i]]
+                    if not isinstance(proto, torch.Tensor):
+                        proto = torch.from_numpy(np.array(proto))
+                    matrix = np.concatenate([matrix, proto.unsqueeze(0)])
                     num.append(len(this_round[keys[i]]) + 1)
                 else:
                     num.append(len(this_round[keys[i]]))
             else:
+                proto = self.global_protos[keys[i]]
+                if not isinstance(proto, torch.Tensor):
+                    proto = torch.from_numpy(np.array(proto))
                 if matrix is None:
-                    matrix = np.array(self.global_protos[keys[i]].unsqueeze(0))
+                    matrix = np.array(proto.unsqueeze(0))
                 else:
-                    matrix = np.concatenate([matrix, self.global_protos[keys[i]].unsqueeze(0)])
+                    matrix = np.concatenate([matrix, proto.unsqueeze(0)])
                 num.append(1)
 
         # Compute cosine similarity adjacency matrix
@@ -613,23 +661,51 @@ class Server_DF(object):
 
     def fed_avg_head(self, chosen_clients):
         """
-        对选定客户端的分类头进行平均
-        
-        Args:
-            chosen_clients: 要平均的客户端索引列表
+        FedSMR-v2: Class-Aware 分类头聚合
+
+        每个类只从真正见过它的客户端聚合，避免未见过类的噪声污染。
         """
-        heads = [self.clients[i].vit.head for i in chosen_clients]
+        use_class_aware = getattr(self.args, 'use_class_aware_head_agg', False)
 
-        result_head = deepcopy(heads[0].state_dict())
-
-        for k in result_head.keys():
-            for i in range(len(heads)):
-                local_model_params = heads[i].state_dict()
-                if i == 0:
-                    result_head[k] = local_model_params[k]
+        if use_class_aware:
+            # 收集每个客户端的 seen_class_mask
+            client_masks = []
+            client_heads = []
+            for i in chosen_clients:
+                if hasattr(self.clients[i], 'seen_classes'):
+                    seen = self.clients[i].seen_classes
+                    mask = torch.zeros(self.args.nb_classes, dtype=torch.bool)
+                    for c in seen:
+                        if 0 <= c < self.args.nb_classes:
+                            mask[c] = True
+                    client_masks.append(mask)
+                    client_heads.append(self.clients[i].model.head.state_dict())
                 else:
-                    result_head[k] += local_model_params[k]
-            result_head[k] = result_head[k] / len(chosen_clients)
+                    client_masks.append(torch.ones(self.args.nb_classes, dtype=torch.bool))
+                    client_heads.append(self.clients[i].model.head.state_dict())
 
-        self.global_head = deepcopy(self.clients[0].vit.head)
+            # 继承上一轮 global head：本轮无人提供的类别保持不变
+            result_head = deepcopy(self.global_head.state_dict())
+            for c in range(self.args.nb_classes):
+                valid = [k for k in range(len(chosen_clients)) if client_masks[k][c]]
+                if len(valid) == 0:
+                    continue
+                for param_key in ['weight', 'bias']:
+                    if param_key in result_head:
+                        vals = [client_heads[k][param_key][c].float() for k in valid]
+                        result_head[param_key][c] = torch.stack(vals).mean(dim=0)
+        else:
+            # 标准 FedAvg
+            heads = [self.clients[i].model.head for i in chosen_clients]
+            result_head = deepcopy(heads[0].state_dict())
+            for k in result_head.keys():
+                for i in range(len(heads)):
+                    local_model_params = heads[i].state_dict()
+                    if i == 0:
+                        result_head[k] = local_model_params[k]
+                    else:
+                        result_head[k] += local_model_params[k]
+                result_head[k] = result_head[k] / len(chosen_clients)
+
+        self.global_head = deepcopy(self.clients[0].model.head)
         self.global_head.load_state_dict(result_head)

@@ -96,8 +96,8 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--task_inc', default=False, type=bool, help='是否进行任务增量学习')
 
     # Prompt Pool 参数
-    subparsers.add_argument('--size', default=20, type=int, help='Prompt 池大小')
-    subparsers.add_argument('--length', default=15, type=int, help='Prompt 长度')
+    subparsers.add_argument('--size', default=100, type=int, help='Prompt 池大小')
+    subparsers.add_argument('--length', default=10, type=int, help='Prompt 长度')
     subparsers.add_argument('--top_k', default=1, type=int, help='选择的 Prompt 数量')
     subparsers.add_argument('--initializer', default='uniform', type=str, help='初始化方法')
     subparsers.add_argument('--prompt_key', default=True, type=bool, help='是否使用 Prompt 键')
@@ -126,50 +126,70 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--method', type=str, default='delay', help='Prompt 方法')
     subparsers.add_argument('--e_prompt_layer_idx', default=[2, 3, 4], type=int, nargs="+",
                             help='E-Prompt 层索引')
-    subparsers.add_argument('--client_num', default=10, type=int, help='客户端数量')
-    subparsers.add_argument('--task_num', default=10, type=int, help='任务数量')
+    subparsers.add_argument('--client_num', default=5, type=int, help='客户端数量')
+    subparsers.add_argument('--task_num', default=5, type=int, help='任务数量')
     subparsers.add_argument('--private_class_num', default=40, type=int, help='每个客户端私有类别数')
-    subparsers.add_argument('--surrogate_num', default=20, type=int, help='代理数据数量')
+    subparsers.add_argument('--surrogate_num', default=5, type=int, help='代理数据数量')
     subparsers.add_argument('--global_epoch', default=5, type=int, help='全局训练轮数')
-    subparsers.add_argument('--local_epoch', default=20, type=int, help='本地训练轮数')
-    subparsers.add_argument('--threshold', default=0.1, type=float, help='相似度阈值')
+    subparsers.add_argument('--local_epoch', default=30, type=int, help='本地训练轮数')
+    subparsers.add_argument('--threshold', default=0.15, type=float, help='相似度阈值')
     subparsers.add_argument('--data_name', default='ImageNet-R', type=str, help='数据集名称')
     subparsers.add_argument('--model_name', default='Tail_Anchor', choices=['AlexNet', 'VGG16', 'ResNet18', 'Tail_Anchor'],
                            type=str, help='模型名称')
 
-    # ===== FedSMR 超参数（论文改进方案） =====
-    # -- Unified Soft Memory Retrieval --
-    subparsers.add_argument('--use_soft_anchor', default=True, type=lambda x: (str(x).lower() == 'true'),
-                            help='是否启用 Soft Anchor Mixture（余弦相似度 + softmax 加权）')
-    subparsers.add_argument('--soft_temperature', default=0.1, type=float,
-                            help='Soft Anchor Mixture 的 softmax 温度系数，越大越平滑')
-    subparsers.add_argument('--use_soft_prompt', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='是否启用 Soft Prompt Retrieval（prompt 侧 softmax 加权）')
-    subparsers.add_argument('--prompt_temperature', default=0.1, type=float,
-                            help='Soft Prompt Retrieval 的温度系数')
+    # ===== FedSMR-v2 超参数 =====
+    # -- Residual Soft-Anchor --
+    subparsers.add_argument('--use_soft_anchor', default=False, type=lambda x: (str(x).lower() == 'true'),
+                            help='是否启用 Residual Soft-Anchor')
+    subparsers.add_argument('--soft_temperature', default=0.17, type=float,
+                            help='Soft Anchor softmax 温度')
+    subparsers.add_argument('--soft_anchor_ratio', default=0.15, type=float,
+                            help='残差系数 γ')
+    subparsers.add_argument('--use_seen_routing', default=False, type=lambda x: (str(x).lower() == 'true'),
+                            help='是否将 Anchor 路由限制在 seen classes（避免未来类污染）')
 
-    # -- Top-K Sparse Softmax --
-    subparsers.add_argument('--use_sparse_softmax', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='是否启用 Top-K 稀疏 Softmax（仅 top-k anchor 参与 softmax）')
-    subparsers.add_argument('--top_k_anchor', default=None, type=int,
-                            help='Top-K 稀疏 Softmax 的 K 值，None 表示使用全部 anchor')
-
-    # -- Temperature Annealing --
-    subparsers.add_argument('--temperature_anneal', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='是否启用温度退火（训练中温度从高到低）')
+    # -- Anchor Routing Loss --
+    subparsers.add_argument('--use_route_loss', default=False, type=lambda x: (str(x).lower() == 'true'),
+                            help='是否启用监督路由损失 L_route')
+    subparsers.add_argument('--route_temperature', default=0.1, type=float,
+                            help='路由损失的温度系数')
+    subparsers.add_argument('--lambda_route', default=0.05, type=float,
+                            help='路由损失权重，建议 0.05~0.1')
 
     # -- Memory Structure Preservation (MSP) --
     subparsers.add_argument('--use_msp', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='是否启用 MSP 三层正则化（多样性 + 一致性 + 时序稳定性）')
-    subparsers.add_argument('--msp_diversity_coeff', default=0.1, type=float,
-                            help='Intra-Pool Diversity 正则化系数')
-    subparsers.add_argument('--msp_coherence_coeff', default=0.1, type=float,
-                            help='Cross-Pool Coherence 正则化系数')
-    subparsers.add_argument('--msp_temporal_coeff', default=0.1, type=float,
-                            help='Temporal Stability 正则化系数')
+                            help='是否启用 MSP 正则化')
+    subparsers.add_argument('--msp_diversity_coeff', default=0.03, type=float,
+                            help='Seen-Only Diversity 系数（v2: 建议0.03）')
+    subparsers.add_argument('--diversity_margin', default=0.2, type=float,
+                            help='Diversity margin: cos>margin才惩罚')
+    subparsers.add_argument('--msp_coherence_coeff', default=0.0, type=float,
+                            help='Coherence 系数（v2: 默认关闭）')
+    subparsers.add_argument('--msp_temporal_coeff', default=0.15, type=float,
+                            help='Key+Anchor Temporal Stability 系数')
+    subparsers.add_argument('--key_temporal_ratio', default=0.5, type=float,
+                            help='Key temporal 在总 temporal loss 中的权重 η')
 
-    # -- Federated Usage-Weighted Aggregation --
+    # -- Prototype Head Replay --
+    subparsers.add_argument('--use_proto_replay', default=False, type=lambda x: (str(x).lower() == 'true'),
+                            help='是否启用 Global Prototype Head Replay')
+    subparsers.add_argument('--lambda_proto', default=0.3, type=float,
+                            help='Proto replay 损失权重，CIFAR-100:0.20, ImageNet-R:0.30')
+
+    # -- Class-Aware Head Aggregation --
+    subparsers.add_argument('--use_class_aware_head_agg', default=False, type=lambda x: (str(x).lower() == 'true'),
+                            help='是否启用类别感知分类头聚合（每个类只从学过的客户端聚合）')
+    subparsers.add_argument('--use_head_grad_mask', default=False, type=lambda x: (str(x).lower() == 'true'),
+                            help='是否启用未见过类的分类头梯度掩码')
+
+    # -- 已废弃/可选增强 --
+    subparsers.add_argument('--use_soft_prompt', default=False, type=lambda x: (str(x).lower() == 'true'),
+                            help='[已废弃] Soft Prompt Retrieval')
+    subparsers.add_argument('--use_sparse_softmax', default=False, type=lambda x: (str(x).lower() == 'true'),
+                            help='[已废弃] Top-K Sparse Softmax')
+    subparsers.add_argument('--temperature_anneal', default=False, type=lambda x: (str(x).lower() == 'true'),
+                            help='[已废弃] Temperature Annealing')
     subparsers.add_argument('--use_fed_smr_aggregate', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='是否启用基于使用频率的联邦加权聚合')
+                            help='[已废弃] 使用频率联邦加权聚合')
 
     

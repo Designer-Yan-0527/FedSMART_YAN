@@ -30,6 +30,7 @@ import torch
 from torch import nn
 from torch.autograd import Variable
 from torch.utils.data import DataLoader, random_split
+from torch.nn import functional as F
 from tqdm import tqdm
 
 from Models.Tail_Anchor import Tail_Anchor
@@ -83,38 +84,48 @@ class Client_DF:
         self.method = method
         self.nb_classes = args.nb_classes
 
-        # ---- FedSMR 超参数 -------------------------------------------------
-        self.use_soft_anchor = getattr(args, 'use_soft_anchor', True)
-        self.soft_temperature = getattr(args, 'soft_temperature', 0.1)
+        # ---- FedSMR-v2 超参数 -----------------------------------------------
+        # Residual Soft-Anchor
+        self.use_soft_anchor = getattr(args, 'use_soft_anchor', False)
+        self.soft_temperature = getattr(args, 'soft_temperature', 0.17)
+        self.soft_anchor_ratio = getattr(args, 'soft_anchor_ratio', 0.25)
+        # 路由损失
+        self.use_route_loss = getattr(args, 'use_route_loss', False)
+        self.route_temperature = getattr(args, 'route_temperature', 0.1)
+        self.lambda_route = getattr(args, 'lambda_route', 0.05)
+        # MSP v2
+        self.use_msp = getattr(args, 'use_msp', False)
+        self.msp_diversity_coeff = getattr(args, 'msp_diversity_coeff', 0.03)
+        self.diversity_margin = getattr(args, 'diversity_margin', 0.2)
+        self.msp_coherence_coeff = getattr(args, 'msp_coherence_coeff', 0.0)
+        self.msp_temporal_coeff = getattr(args, 'msp_temporal_coeff', 0.1)
+        self.key_temporal_ratio = getattr(args, 'key_temporal_ratio', 0.5)
+        # Proto Replay
+        self.use_proto_replay = getattr(args, 'use_proto_replay', False)
+        self.lambda_proto = getattr(args, 'lambda_proto', 0.2)
+        # Head 保护
+        self.use_head_grad_mask = getattr(args, 'use_head_grad_mask', False)
+        self.use_seen_routing = getattr(args, 'use_seen_routing', False)
+        # 已废弃保留
         self.use_soft_prompt = getattr(args, 'use_soft_prompt', False)
-        self.prompt_temperature = getattr(args, 'prompt_temperature', 0.1)
         self.use_sparse_softmax = getattr(args, 'use_sparse_softmax', False)
         self.top_k_anchor = getattr(args, 'top_k_anchor', None)
         self.temperature_anneal = getattr(args, 'temperature_anneal', False)
-        self.use_msp = getattr(args, 'use_msp', True)
-        self.msp_diversity_coeff = getattr(args, 'msp_diversity_coeff', 0.05)
-        self.msp_coherence_coeff = getattr(args, 'msp_coherence_coeff', 0.01)
-        self.msp_temporal_coeff = getattr(args, 'msp_temporal_coeff', 0.01)
-        # --------------------------------------------------------------------
+        # -------------------------------------------------------------------
 
         self.model = self._init_local_model(model_name)
 
-        # ---- FedSMR: 将 soft prompt 参数传播到 Global_Prompt 模块 ----
-        if hasattr(self.vit, 'prompt'):
-            self.vit.prompt.use_soft_prompt = self.use_soft_prompt
-            self.vit.prompt.prompt_temperature = self.prompt_temperature
-        # ------------------------------------------------------------
-
-        # 存储上一轮的记忆状态（用于 temporal stability loss）
+        # 存储上一轮记忆状态（用于 Key+Anchor temporal stability）
         self.prev_anchor_pool = None
-        self.prev_prompt = None
-        self.prev_prompt_key = None
+        self.prev_key_pool = None
 
-        # 自适应 MSP: 是否有公共类（用于 coherence 开关）
-        # |Cp| = nb_classes - client_num * private_class_num
+        # 已见类别追踪
+        self.seen_classes = set()
+        self.old_seen_classes = set()
+
+        # 自适应: 是否有公共类
         total_private = args.client_num * args.private_class_num
-        public_count = max(0, args.nb_classes - total_private)
-        self._has_public_classes = (public_count > 0)  # CIFAR-100: True, ImageNet-R: False
+        self._has_public_classes = (max(0, args.nb_classes - total_private) > 0)
 
         # Initialize class mask based on dataset type
         if args.data_name in ['cifar100', '5datasets', 'ImageNet-R', 'svhn-mnist']:
@@ -151,12 +162,15 @@ class Client_DF:
             return Tail_Anchor(
                 anchor_size=10,
                 key_size=768,
-                nb_class=200,
+                nb_class=self.nb_classes,
                 soft_anchor=self.use_soft_anchor,
                 soft_temperature=self.soft_temperature,
+                soft_anchor_ratio=self.soft_anchor_ratio,
                 top_k_anchor=self.top_k_anchor,
                 temperature_anneal=self.temperature_anneal,
                 use_sparse_softmax=self.use_sparse_softmax,
+                diversity_margin=self.diversity_margin,
+                use_seen_routing=self.use_seen_routing,
             )
 
     def _init_log_file(self):
@@ -230,79 +244,121 @@ class Client_DF:
 
     def _compute_msp_losses(self, feat_prompt, anchor_feat, round_num):
         """
-        FedSMR: 计算 Memory Structure Preservation 损失（自适应版本）
+        FedSMR-v2: MSP 损失 (Seen-Only Diversity + Key&Anchor Temporal)
 
-        三层正则化：
-        1. Intra-Pool Diversity:  保持 anchor 池内多样性（所有场景适用）
-        2. Cross-Pool Coherence:  保持 prompt-anchor 一致性（仅在有关公共类时生效）
-        3. Temporal Stability:    置信度加权时序约束（使用频率高→强约束，低→弱约束）
-
-        Args:
-            feat_prompt: prompt 增强后的特征 (B, C)
-            anchor_feat: anchor 组合后的特征 (B, C)
-            round_num: 当前全局轮次
-
-        Returns:
-            total_msp_loss: MSP 总损失
+        去除 Coherence，增加 Key temporal。
+        只约束已见类别。
         """
         total_msp_loss = torch.tensor(0.0, device=self.device)
 
-        # ---- 1. Intra-Pool Diversity ----
-        # 所有场景统一使用，不做自适应
-        if hasattr(self.model, 'anchor_diversity_loss'):
+        # ---- 1. Seen-Only Diversity (带 margin) ----
+        if self.msp_diversity_coeff > 0 and hasattr(self.model, 'anchor_diversity_loss'):
             loss_anchor_div = self.model.anchor_diversity_loss()
             total_msp_loss = total_msp_loss + self.msp_diversity_coeff * loss_anchor_div
 
-        # Prompt diversity (通过 vit 的 prompt 模块)
-        if self.use_soft_prompt and hasattr(self.vit, 'prompt'):
-            for attr_name in ['prompt', 'e_prompt', 'g_prompt']:
-                if hasattr(self.vit, attr_name):
-                    prompt_module = getattr(self.vit, attr_name)
-                    if hasattr(prompt_module, 'prompt_diversity_loss'):
-                        loss_prompt_div = prompt_module.prompt_diversity_loss()
-                        total_msp_loss = total_msp_loss + self.msp_diversity_coeff * loss_prompt_div
-                        break
+        # ---- 2. Key + Anchor Temporal Stability (cosine loss, hard usage, old-class-only) ----
+        if self.msp_temporal_coeff > 0:
+            if self.prev_anchor_pool is not None and self.prev_key_pool is not None:
+                # 只约束旧类（已见但非当前 task 的类）
+                old_classes = sorted(self.old_seen_classes)
+                if len(old_classes) > 0:
+                    old_mask = torch.tensor(old_classes, device=self.device, dtype=torch.long)
 
-        # ---- 2. Cross-Pool Coherence（自适应：无公共类时自动禁用） ----
-        if feat_prompt is not None and anchor_feat is not None and self.msp_coherence_coeff > 0:
-            # |Cp|=0 时禁用 coherence，有公共类时保持原始强度
-            if self._has_public_classes:
-                f_p_norm = torch.nn.functional.normalize(feat_prompt, p=2, dim=1)
-                f_a_norm = torch.nn.functional.normalize(anchor_feat, p=2, dim=1)
-                cos_sim = torch.sum(f_p_norm * f_a_norm, dim=1)
-                # 区间约束: cos 在 [0.3, 0.7] 内不惩罚
-                lower_violation = torch.clamp(0.3 - cos_sim, min=0)
-                upper_violation = torch.clamp(cos_sim - 0.7, min=0)
-                loss_coherence = (lower_violation + upper_violation).mean()
-                total_msp_loss = total_msp_loss + (
-                    self.msp_coherence_coeff * loss_coherence
-                )
+                    # --- Anchor temporal (cosine) ---
+                    curr_anchor = F.normalize(
+                        self.model.anchor_pool[old_mask], dim=1
+                    )
+                    prev_anchor = F.normalize(
+                        self.prev_anchor_pool[old_mask].to(self.device), dim=1
+                    )
+                    loss_anchor_tmp = (1.0 - (curr_anchor * prev_anchor).sum(dim=1))
 
-        # ---- 3. Temporal Stability（自适应：置信度加权） ----
-        if self.prev_anchor_pool is not None and self.msp_temporal_coeff > 0:
-            current_anchor = self.model.anchor_pool.data
-            prev_anchor = self.prev_anchor_pool.to(self.device)
+                    # --- Key temporal (cosine) ---
+                    curr_key_pool = self.model.key.reshape(-1, self.model.key_size)
+                    curr_key = F.normalize(curr_key_pool[old_mask], dim=1)
+                    prev_key = F.normalize(
+                        self.prev_key_pool[old_mask].to(self.device), dim=1
+                    )
+                    loss_key_tmp = (1.0 - (curr_key * prev_key).sum(dim=1))
 
-            # 置信度加权: 使用频率高的 anchor → 更可靠的估计 → 更强的时序约束
-            # 使用频率低的 anchor → 噪声大 → 弱约束（允许自适应调整）
-            if hasattr(self.model, 'get_anchor_usage'):
-                usage = self.model.get_anchor_usage().to(self.device)  # (nb_class,)
-                # 归一化到 [0, 1]，避免绝对尺度影响
-                usage_max = usage.max()
-                if usage_max > 0:
-                    confidence = (usage / usage_max).unsqueeze(1)  # (nb_class, 1)
-                else:
-                    confidence = torch.ones_like(current_anchor)
-            else:
-                confidence = torch.ones_like(current_anchor)
+                    # Hard usage 置信度加权 (P1.7 FIX: 使用 round 开始前的 usage)
+                    if hasattr(self, 'prev_anchor_usage') and self.prev_anchor_usage is not None:
+                        usage = self.prev_anchor_usage.to(self.device)
+                        confidence = usage[old_mask]
+                        conf_max = confidence.max()
+                        if conf_max > 0:
+                            confidence = confidence / (conf_max + 1e-8)
+                            confidence = 0.2 + 0.8 * confidence  # floor
+                        else:
+                            confidence = torch.ones_like(confidence)
+                    else:
+                        confidence = torch.ones(len(old_classes), device=self.device)
 
-            # 加权 MSE: 高置信度 anchor → 强约束；低置信度 → 弱约束
-            loss_temporal = (
-                confidence * (current_anchor - prev_anchor) ** 2
-            ).mean()
-            total_msp_loss = total_msp_loss + self.msp_temporal_coeff * loss_temporal
+                    loss_anchor_tmp = (confidence * loss_anchor_tmp).mean()
+                    loss_key_tmp = (confidence * loss_key_tmp).mean()
+
+                    eta = self.key_temporal_ratio
+                    loss_temporal = loss_anchor_tmp + eta * loss_key_tmp
+                    total_msp_loss = total_msp_loss + self.msp_temporal_coeff * loss_temporal
 
         return total_msp_loss
+
+    def _compute_route_loss(self, similarity, target, seen_classes):
+        """
+        FedSMR-v2: 监督路由损失 L_route
+
+        强制样本特征与正确类别的 key 对齐。
+        只计算客户端已见过的类别。
+        """
+        if len(seen_classes) == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        seen_list = sorted(seen_classes)
+        seen_idx = torch.tensor(seen_list, device=target.device, dtype=torch.long)
+
+        # 只取 seen classes 的 logits
+        route_logits = similarity[:, seen_idx] / self.route_temperature
+
+        # 建立 global label → seen-index 映射
+        global_to_local = {g: i for i, g in enumerate(seen_list)}
+        local_target = torch.tensor(
+            [global_to_local.get(t.item(), 0) for t in target],
+            device=target.device, dtype=torch.long
+        )
+
+        return F.cross_entropy(route_logits, local_target)
+
+    def _compute_proto_replay_loss(self, global_protos):
+        """
+        FedSMR-v2: Global Prototype Head Replay
+
+        用服务器维护的全局原型重放旧类，保护旧类分类边界。
+        """
+        if global_protos is None or len(self.old_seen_classes) == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        old_classes = sorted(self.old_seen_classes)
+        proto_list = []
+        valid_classes = []
+        for c in old_classes:
+            if c in global_protos:
+                proto = global_protos[c]
+                if isinstance(proto, torch.Tensor):
+                    proto = proto.to(self.device)
+                else:
+                    proto = torch.from_numpy(np.array(proto)).float().to(self.device)
+                # proto 是 1536 维 feat_mixed，直接输入 classification head
+                proto_list.append(proto)
+                valid_classes.append(c)
+
+        if len(proto_list) == 0:
+            return torch.tensor(0.0, device=self.device)
+
+        proto_feat = torch.stack(proto_list)               # (N, 1536)
+        proto_target = torch.tensor(valid_classes, device=self.device, dtype=torch.long)
+
+        proto_logits = self.model.head(proto_feat)
+        return F.cross_entropy(proto_logits, proto_target)
 
     def train(self, round, args):
         """
@@ -319,11 +375,23 @@ class Client_DF:
 
         self.set_round(round)
 
-        # 保存上一轮记忆状态（用于 temporal stability）
+        # 保存上一轮记忆状态（用于 Key+Anchor temporal stability）
         if hasattr(self.model, 'anchor_pool'):
             self.prev_anchor_pool = self.model.anchor_pool.data.clone().cpu()
-        if self.prompts is not None:
-            self.prev_prompt = deepcopy(self.prompts)
+        if hasattr(self.model, 'key'):
+            self.prev_key_pool = self.model.key.data.clone().cpu()
+        # P1.7 FIX: 保存本轮开始前的 usage（不含当前任务的新数据）
+        if hasattr(self.model, 'get_anchor_usage'):
+            self.prev_anchor_usage = self.model.get_anchor_usage().detach().clone().cpu()
+
+        # 追踪已见类别
+        old_seen = set(self.seen_classes)
+        self.seen_classes.update(self.current_class)
+        self.old_seen_classes = old_seen - set(self.current_class)
+
+        # 更新 Tail_Anchor 的 seen_class_mask
+        if hasattr(self.model, 'set_seen_classes'):
+            self.model.set_seen_classes(self.current_class)
 
         # Load or initialize prompts
         if self.prompts is not None:
@@ -374,18 +442,7 @@ class Client_DF:
                                            value=float('-inf'))
 
                 loss = criterion(logits, target) - 0.1 * pull_off
-
-                # ---- FedSMR: MSP Loss (Phase 1) ----
-                if self.use_msp and feat_prompt is not None:
-                    with torch.no_grad():
-                        # 用冻结的 anchor 获取 anchor 特征用于 coherence loss
-                        _, _, _, anchor_feat, _ = self.model(
-                            feat_prompt.detach(), target.to(self.device)
-                        )
-                    msp_loss = self._compute_msp_losses(feat_prompt, anchor_feat, round)
-                    loss = loss + msp_loss
-                # ------------------------------------
-
+                # P1.6 FIX: MSP 仅放 Phase 2 (Phase 1 optimizer 不更新 anchor/key)
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -395,6 +452,7 @@ class Client_DF:
         # =============================================================
         # Phase 2: Train classification head + anchor_pool (Soft Anchor + MSP + InfoNCE)
         # =============================================================
+        self.model.train()  # usage 只在训练模式累积
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=1e-3)
 
         for epoch in tqdm(range(self.local_epoch)):
@@ -412,8 +470,8 @@ class Client_DF:
                                       cls_features=cls_features, train=True)
                     feat_prompt = output['feat']
 
-                # FedSMR: forward 返回 5 个值 (logits, output_mixed, reduce_sim, anchor_feat, attn_weights)
-                pre, output_mixed, pull_off2, anchor_feat, attn_weights = self.model(
+                # FedSMR-v2: forward 返回 6 个值
+                pre, output_mixed, pull_off2, anchor_feat, attn_weights, hard_idx = self.model(
                     feat_prompt.to(self.device), target.to(self.device),
                     global_step=global_step, total_steps=total_steps * 2
                 )
@@ -454,25 +512,58 @@ class Client_DF:
                     - 0.1 * pull_off2
                 )
 
-                # ---- FedSMR: MSP Loss (Phase 2) ----
-                if self.use_msp:
-                    msp_loss = self._compute_msp_losses(feat_prompt, anchor_feat, round)
-                    loss = loss + msp_loss
-                # ------------------------------------
+                # ---- FedSMR-v2: 路由损失 ----
+                if self.use_route_loss:
+                    sim = self.model.compute_similarity(feat_prompt.to(self.device))
+                    route_loss = self._compute_route_loss(
+                        sim, target, self.seen_classes
+                    )
+                    loss = loss + self.lambda_route * route_loss
 
-                if round == 16 and self.id == 0:
-                    print(loss_infonce)
-                    print(criterion(logits, target))
+                # ---- FedSMR-v2: MSP (Diversity + Key&Anchor Temporal) ----
+                if self.use_msp:
+                    msp_loss = self._compute_msp_losses(None, None, round)
+                    loss = loss + msp_loss
+
+                # ---- FedSMR-v2: Prototype Head Replay ----
+                if self.use_proto_replay and self.global_protos is not None:
+                    proto_loss = self._compute_proto_replay_loss(self.global_protos)
+                    loss = loss + self.lambda_proto * proto_loss
+                # ----------------------------------------------------
 
                 optimizer.zero_grad()
                 loss.backward()
 
-                
+                # ---- P0.1 FIX + 建议8: Head grad mask (grad zero + backup/restore) ----
+                if self.use_head_grad_mask and hasattr(self.model, 'head'):
+                    unseen_mask = torch.ones(self.nb_classes, dtype=torch.bool, device=self.device)
+                    for c in self.seen_classes:
+                        if 0 <= c < self.nb_classes:
+                            unseen_mask[c] = False
+                    # 先清零梯度 (阻止 Adam optimizer state 污染)
+                    if self.model.head.weight.grad is not None:
+                        self.model.head.weight.grad[unseen_mask] = 0.0
+                    if self.model.head.bias is not None and self.model.head.bias.grad is not None:
+                        self.model.head.bias.grad[unseen_mask] = 0.0
+                    # 备份参数 (防止 weight decay 改变值)
+                    with torch.no_grad():
+                        w_backup = self.model.head.weight[unseen_mask].clone()
+                        b_backup = (self.model.head.bias[unseen_mask].clone()
+                                    if self.model.head.bias is not None else None)
+
                 optimizer.step()
+
+                if self.use_head_grad_mask and hasattr(self.model, 'head'):
+                    with torch.no_grad():
+                        self.model.head.weight[unseen_mask] = w_backup
+                        if b_backup is not None:
+                            self.model.head.bias[unseen_mask] = b_backup
+                # ------------------------------------------------------------
 
                 global_step += 1
 
         # Extract local prototypes from training data
+        self.model.eval()  # 评估/原型提取不累积 usage
         target_list = []
         feature_list = []
 
@@ -486,7 +577,7 @@ class Client_DF:
                     output = output['pre_logits'].requires_grad_(False)
                 output = self.vit(input, task_id=self.task_id, cls_features=output,
                                   train=True)
-                _, output_mixed, _, _, _ = self.model(
+                _, output_mixed, _, _, _, _ = self.model(
                     output['feat'].to(self.device), target.to(self.device)
                 )
 
@@ -526,7 +617,9 @@ class Client_DF:
     def get_global_proto_and_head(self, proto, head, prompt, round_num):
         """更新全局原型、分类头和提示，然后进行评估"""
         self.global_protos = deepcopy(proto)
-        self.global_head = head
+        self.global_head = deepcopy(head)
+        # P0.4 FIX: 将 global head 真正载入 Tail_Anchor
+        self.model.load_head(deepcopy(head))
         self.prompts = prompt
         self.vit.load_prompts(self.prompts)
 
@@ -539,7 +632,9 @@ class Client_DF:
     def get_global_proto_and_head_no_test(self, proto, head, prompt, round_num):
         """更新全局原型、分类头和提示，不进行评估"""
         self.global_protos = deepcopy(proto)
-        self.global_head = head
+        self.global_head = deepcopy(head)
+        # P0.4 FIX: 将 global head 真正载入 Tail_Anchor
+        self.model.load_head(deepcopy(head))
         self.prompts = prompt
         self.vit.load_prompts(self.prompts)
 
@@ -604,6 +699,7 @@ class Client_DF:
 
     def evaluate(self, task=0, nb_classes=None):
         """使用提示和分类头进行标准评估"""
+        self.model.eval()
         test_data = self.test_loader[task]
         test_loader = DataLoader(test_data, batch_size=8, shuffle=True)
         correct = 0
@@ -621,7 +717,7 @@ class Client_DF:
                     output = self.original_model(input)
                     output = output['pre_logits'].requires_grad_(False)
                     output = self.vit(input, task_id=self.task_id, cls_features=output, train=True)
-                    pre, _, _, _, _ = self.model(output['feat'].to(self.device), target.to(self.device))
+                    pre, _, _, _, _, _ = self.model(output['feat'].to(self.device), target.to(self.device))
 
             logits = pre
 
@@ -641,12 +737,15 @@ class Client_DF:
 
     def evaluate_with_global_head(self, task=0, nb_classes=None):
         """使用全局分类头进行评估（服务器聚合后）"""
+        self.model.eval()
         test_data = self.test_loader[task]
         test_loader = DataLoader(test_data, batch_size=8, shuffle=True)
         correct = 0
         total = 0
 
-        self.model.load_head(self.heads[task])
+        # P0.4 FIX: 加载 global head，不是 local task head
+        if self.global_head is not None:
+            self.model.load_head(deepcopy(self.global_head))
         self.model.to(self.device)
 
         for input, target in test_loader:
@@ -658,7 +757,7 @@ class Client_DF:
                     output = self.original_model(input)
                     output = output['pre_logits'].requires_grad_(False)
                     output = self.vit(input, task_id=self.task_id, cls_features=output, train=True)
-                    pre, _, _, _, _ = self.model(output['feat'].to(self.device), target.to(self.device))
+                    pre, _, _, _, _, _ = self.model(output['feat'].to(self.device), target.to(self.device))
 
             logits = pre
 
@@ -678,6 +777,7 @@ class Client_DF:
 
     def evaluate_cosin_similarity(self, task=0, nb_classes=None):
         """使用全局原型的余弦相似度进行评估"""
+        self.model.eval()
         test_data = self.test_loader[task]
         test_loader = DataLoader(test_data, batch_size=4, shuffle=True, num_workers=2)
         correct = 0
@@ -690,10 +790,12 @@ class Client_DF:
             with torch.no_grad():
                 if self.original_model is not None:
                     output = self.original_model(input)
-                _, output_mix, _, _, _ = self.model(output, None)
+                    cls_features = output['pre_logits']
+                    output = self.vit(input, task_id=self.task_id, cls_features=cls_features, train=True)
+                _, output_mix, _, _, _, _ = self.model(output['feat'].to(self.device), target.to(self.device))
 
             for i, label in enumerate(target):
-                predicts = CosineSimilarityClassifier(output_mix[i].squeeze(0), self.global_protos, self.current_class)
+                predicts = CosineSimilarityClassifier(output_mix[i].squeeze(0), self.global_protos, self.class_mask[task])
                 if predicts == label:
                     correct += 1
             total += len(target)
@@ -894,7 +996,7 @@ class Client_DF:
                     output = self.original_model(input)
                     output = output['pre_logits'].requires_grad_(False)
                     output = self.vit(input, task_id=self.task_id, cls_features=output, train=True)
-                    _, _, _, _, _ = self.model(output['feat'].to(self.device), target.to(self.device))
+                    _, _, _, _, _, _ = self.model(output['feat'].to(self.device), target.to(self.device))
 
                 output = self.head(output['feat'])
 
