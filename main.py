@@ -16,6 +16,8 @@ Key Features:
 """
 
 import argparse
+import json
+import os
 from pathlib import Path
 import random
 
@@ -100,8 +102,17 @@ def main(args):
             task_num=args.task_num,
             private_class_num=args.private_class_num,
             input_size=args.input_size
-        ).process_testdata(5)
+        ).process_testdata(args.surrogate_num)
         surro_data = iCIFAR100c(subset=surro_data)
+
+    else:
+        raise ValueError(f"Unsupported dataset: {args.data_name}. "
+                         f"Supported datasets: cifar100, ImageNet-R")
+
+    # Save experiment configuration for reproducibility
+    os.makedirs(args.output_dir, exist_ok=True)
+    with open(os.path.join(args.output_dir, "config.json"), "w") as f:
+        json.dump(vars(args), f, indent=4)
 
     # Initialize original (base) model without prompts
     print(f"Creating original model: {args.model}")
@@ -134,8 +145,7 @@ def main(args):
         prompt_key_init=args.prompt_key_init,
         head_type=args.head_type,
         use_prompt_mask=args.use_prompt_mask,
-        use_soft_prompt=args.use_soft_prompt,
-        prompt_temperature=args.prompt_temperature,
+        use_soft_prompt=args.use_soft_prompt
     )
 
     # Load pretrained weights
@@ -174,7 +184,7 @@ def main(args):
             global_epoch=args.global_epoch,
             local_epoch=args.local_epoch,
             batch_size=args.batch_size,
-            device=args.device,
+            device=device,
             method=args.method,
             threshold=args.threshold,
             surrogate_data=surro_data,
@@ -195,7 +205,7 @@ def main(args):
             global_epoch=args.global_epoch,
             local_epoch=args.local_epoch,
             batch_size=args.batch_size,
-            device=args.device,
+            device=device,
             method=args.method,
             threshold=args.threshold,
             surrogate_data=None,

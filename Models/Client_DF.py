@@ -624,10 +624,10 @@ class Client_DF:
         self.vit.load_prompts(self.prompts)
 
         if self.task_id == 0:
-            self.evaluate_with_global_head(self.task_id, self.nb_classes)
+            self.evaluate(self.task_id, self.nb_classes)
         else:
-            self.evaluate_with_global_head(0, self.nb_classes)
-            self.evaluate_with_global_head(self.task_id, self.nb_classes)
+            self.evaluate(0, self.nb_classes)
+            self.evaluate(self.task_id, self.nb_classes)
 
     def get_global_proto_and_head_no_test(self, proto, head, prompt, round_num):
         """更新全局原型、分类头和提示，不进行评估"""
