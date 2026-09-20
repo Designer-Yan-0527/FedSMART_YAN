@@ -536,28 +536,31 @@ class Client_DF:
 
                 # ---- P0.1 FIX + 建议8: Head grad mask (grad zero + backup/restore) ----
                 if self.use_head_grad_mask and hasattr(self.model, 'head'):
+                    # Chead 包装了 nn.Sequential，输出层在 head.head[3] (最后一个 Linear)
+                    head_output = self.model.head.head[3] if hasattr(self.model.head, 'head') else self.model.head
                     unseen_mask = torch.ones(self.nb_classes, dtype=torch.bool, device=self.device)
                     for c in self.seen_classes:
                         if 0 <= c < self.nb_classes:
                             unseen_mask[c] = False
                     # 先清零梯度 (阻止 Adam optimizer state 污染)
-                    if self.model.head.weight.grad is not None:
-                        self.model.head.weight.grad[unseen_mask] = 0.0
-                    if self.model.head.bias is not None and self.model.head.bias.grad is not None:
-                        self.model.head.bias.grad[unseen_mask] = 0.0
+                    if head_output.weight.grad is not None:
+                        head_output.weight.grad[unseen_mask] = 0.0
+                    if head_output.bias is not None and head_output.bias.grad is not None:
+                        head_output.bias.grad[unseen_mask] = 0.0
                     # 备份参数 (防止 weight decay 改变值)
                     with torch.no_grad():
-                        w_backup = self.model.head.weight[unseen_mask].clone()
-                        b_backup = (self.model.head.bias[unseen_mask].clone()
-                                    if self.model.head.bias is not None else None)
+                        w_backup = head_output.weight[unseen_mask].clone()
+                        b_backup = (head_output.bias[unseen_mask].clone()
+                                    if head_output.bias is not None else None)
 
                 optimizer.step()
 
                 if self.use_head_grad_mask and hasattr(self.model, 'head'):
+                    head_output = self.model.head.head[3] if hasattr(self.model.head, 'head') else self.model.head
                     with torch.no_grad():
-                        self.model.head.weight[unseen_mask] = w_backup
+                        head_output.weight[unseen_mask] = w_backup
                         if b_backup is not None:
-                            self.model.head.bias[unseen_mask] = b_backup
+                            head_output.bias[unseen_mask] = b_backup
                 # ------------------------------------------------------------
 
                 global_step += 1
