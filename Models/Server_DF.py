@@ -144,14 +144,10 @@ class Server_DF(object):
         # 可选增强后缀
         if getattr(self.args, 'use_route_loss', False):
             parts.append('Route')
-        if getattr(self.args, 'use_class_aware_head_agg', False):
-            parts.append('CA')
         if getattr(self.args, 'use_proto_replay', False):
             parts.append('Proto')
         if getattr(self.args, 'use_seen_routing', False):
             parts.append('SeenRoute')
-        if getattr(self.args, 'use_head_grad_mask', False):
-            parts.append('HeadMask')
 
         parts.append(dataset)
         return '_'.join(parts) + '.csv'
@@ -266,22 +262,6 @@ class Server_DF(object):
 
         return averaged_params
 
-    def fed_smr_aggregate(self, sample_nums):
-        """
-        FedSMR: 基于使用频率的联邦记忆聚合
-
-        对 anchor_pool 使用使用频率加权聚合，其余参数使用标准 FedAvg。
-        高频使用的记忆向量（共识强）获得更高聚合权重，
-        低频使用的记忆向量保留客户端特异性。
-
-        Args:
-            sample_nums: 每个客户端的样本数量列表
-
-        Returns:
-            聚合后的模型参数（state_dict）
-        """
-        return self.fedavg(sample_nums, use_usage_weights=True)
-
     def train_clients(self):
         """
         协调所有客户端跨任务和轮次的主训练循环
@@ -314,15 +294,6 @@ class Server_DF(object):
             # Train each selected client
             for j in self.thisclients:
                 self.clients[j].train(round=i, args=self.args)
-
-            # ---- FedSMR: 使用频率加权联邦聚合 ----
-            if getattr(self.args, 'use_fed_smr_aggregate', False):
-                sample_nums = [len(self.clients[j].traindata) for j in self.thisclients]
-                smr_weights = self.fed_smr_aggregate(sample_nums)
-                for j in self.thisclients:
-                    self.clients[j].model.load_state_dict(smr_weights)
-                print('FedSMR usage-weighted aggregation complete')
-            # -----------------------------------------
 
             # Select best prototypes using greedy similarity matching
             self.choose_best_proto_greedy_similarity_fixed_key(
@@ -661,51 +632,26 @@ class Server_DF(object):
 
     def fed_avg_head(self, chosen_clients):
         """
-        FedSMR-v2: Class-Aware 分类头聚合
+        对选定客户端的 Input Enhancement 分类头 (vit.head) 进行联邦平均
 
-        每个类只从真正见过它的客户端聚合，避免未见过类的噪声污染。
+        原始 FedTA 聚合的是 vit.head（Stage 1 Input Enhancement 的分类头），
+        而非 Tail Anchor 的 model.head（Stage 2 按 task 独立保存）。
+
+        Args:
+            chosen_clients: 要平均的客户端索引列表
         """
-        use_class_aware = getattr(self.args, 'use_class_aware_head_agg', False)
+        heads = [self.clients[i].vit.head for i in chosen_clients]
 
-        if use_class_aware:
-            # 收集每个客户端的 seen_class_mask
-            client_masks = []
-            client_heads = []
-            for i in chosen_clients:
-                if hasattr(self.clients[i], 'seen_classes'):
-                    seen = self.clients[i].seen_classes
-                    mask = torch.zeros(self.args.nb_classes, dtype=torch.bool)
-                    for c in seen:
-                        if 0 <= c < self.args.nb_classes:
-                            mask[c] = True
-                    client_masks.append(mask)
-                    client_heads.append(self.clients[i].model.head.state_dict())
+        result_head = deepcopy(heads[0].state_dict())
+
+        for k in result_head.keys():
+            for i in range(len(heads)):
+                local_model_params = heads[i].state_dict()
+                if i == 0:
+                    result_head[k] = local_model_params[k]
                 else:
-                    client_masks.append(torch.ones(self.args.nb_classes, dtype=torch.bool))
-                    client_heads.append(self.clients[i].model.head.state_dict())
+                    result_head[k] += local_model_params[k]
+            result_head[k] = result_head[k] / len(chosen_clients)
 
-            # 继承上一轮 global head：本轮无人提供的类别保持不变
-            result_head = deepcopy(self.global_head.state_dict())
-            for c in range(self.args.nb_classes):
-                valid = [k for k in range(len(chosen_clients)) if client_masks[k][c]]
-                if len(valid) == 0:
-                    continue
-                for param_key in ['weight', 'bias']:
-                    if param_key in result_head:
-                        vals = [client_heads[k][param_key][c].float() for k in valid]
-                        result_head[param_key][c] = torch.stack(vals).mean(dim=0)
-        else:
-            # 标准 FedAvg
-            heads = [self.clients[i].model.head for i in chosen_clients]
-            result_head = deepcopy(heads[0].state_dict())
-            for k in result_head.keys():
-                for i in range(len(heads)):
-                    local_model_params = heads[i].state_dict()
-                    if i == 0:
-                        result_head[k] = local_model_params[k]
-                    else:
-                        result_head[k] += local_model_params[k]
-                result_head[k] = result_head[k] / len(chosen_clients)
-
-        self.global_head = deepcopy(self.clients[0].model.head)
+        self.global_head = deepcopy(self.clients[0].vit.head)
         self.global_head.load_state_dict(result_head)

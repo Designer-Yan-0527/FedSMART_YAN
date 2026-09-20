@@ -103,8 +103,6 @@ class Client_DF:
         # Proto Replay
         self.use_proto_replay = getattr(args, 'use_proto_replay', False)
         self.lambda_proto = getattr(args, 'lambda_proto', 0.2)
-        # Head 保护
-        self.use_head_grad_mask = getattr(args, 'use_head_grad_mask', False)
         self.use_seen_routing = getattr(args, 'use_seen_routing', False)
         # 已废弃保留
         self.use_soft_prompt = getattr(args, 'use_soft_prompt', False)
@@ -533,35 +531,7 @@ class Client_DF:
 
                 optimizer.zero_grad()
                 loss.backward()
-
-                # ---- P0.1 FIX + 建议8: Head grad mask (grad zero + backup/restore) ----
-                if self.use_head_grad_mask and hasattr(self.model, 'head'):
-                    # Chead 包装了 nn.Sequential，输出层在 head.head[3] (最后一个 Linear)
-                    head_output = self.model.head.head[3] if hasattr(self.model.head, 'head') else self.model.head
-                    unseen_mask = torch.ones(self.nb_classes, dtype=torch.bool, device=self.device)
-                    for c in self.seen_classes:
-                        if 0 <= c < self.nb_classes:
-                            unseen_mask[c] = False
-                    # 先清零梯度 (阻止 Adam optimizer state 污染)
-                    if head_output.weight.grad is not None:
-                        head_output.weight.grad[unseen_mask] = 0.0
-                    if head_output.bias is not None and head_output.bias.grad is not None:
-                        head_output.bias.grad[unseen_mask] = 0.0
-                    # 备份参数 (防止 weight decay 改变值)
-                    with torch.no_grad():
-                        w_backup = head_output.weight[unseen_mask].clone()
-                        b_backup = (head_output.bias[unseen_mask].clone()
-                                    if head_output.bias is not None else None)
-
                 optimizer.step()
-
-                if self.use_head_grad_mask and hasattr(self.model, 'head'):
-                    head_output = self.model.head.head[3] if hasattr(self.model.head, 'head') else self.model.head
-                    with torch.no_grad():
-                        head_output.weight[unseen_mask] = w_backup
-                        if b_backup is not None:
-                            head_output.bias[unseen_mask] = b_backup
-                # ------------------------------------------------------------
 
                 global_step += 1
 
@@ -605,10 +575,13 @@ class Client_DF:
 
         # Evaluate after training
         if self.task_id == 0:
-            self.evaluate(self.task_id, args.nb_classes)
+            self.evaluate(self.task_id, args.nb_classes,
+                          phase="Local Training", notes_prefix="Local evaluation on task")
         else:
-            self.evaluate(0, args.nb_classes)
-            self.evaluate(self.task_id, args.nb_classes)
+            self.evaluate(0, args.nb_classes,
+                          phase="Local Training", notes_prefix="Local evaluation on task")
+            self.evaluate(self.task_id, args.nb_classes,
+                          phase="Local Training", notes_prefix="Local evaluation on task")
 
         self.prompts = deepcopy(self.vit.get_prompts())
 
@@ -620,9 +593,9 @@ class Client_DF:
     def get_global_proto_and_head(self, proto, head, prompt, round_num):
         """更新全局原型、分类头和提示，然后进行评估"""
         self.global_protos = deepcopy(proto)
+        # 这是 Input Enhancement (vit.head) 聚合后的全局分类头
+        # 原始 FedTA 不会将其加载到 Tail Anchor 的 model.head
         self.global_head = deepcopy(head)
-        # P0.4 FIX: 将 global head 真正载入 Tail_Anchor
-        self.model.load_head(deepcopy(head))
         self.prompts = prompt
         self.vit.load_prompts(self.prompts)
 
@@ -635,9 +608,9 @@ class Client_DF:
     def get_global_proto_and_head_no_test(self, proto, head, prompt, round_num):
         """更新全局原型、分类头和提示，不进行评估"""
         self.global_protos = deepcopy(proto)
+        # 这是 Input Enhancement (vit.head) 聚合后的全局分类头
+        # 原始 FedTA 不会将其加载到 Tail Anchor 的 model.head
         self.global_head = deepcopy(head)
-        # P0.4 FIX: 将 global head 真正载入 Tail_Anchor
-        self.model.load_head(deepcopy(head))
         self.prompts = prompt
         self.vit.load_prompts(self.prompts)
 
@@ -700,7 +673,8 @@ class Client_DF:
             self.evaluate(0, args.nb_classes)
             self.evaluate(self.task_id, args.nb_classes)
 
-    def evaluate(self, task=0, nb_classes=None):
+    def evaluate(self, task=0, nb_classes=None, phase="Server Aggregation",
+                 notes_prefix="Global evaluation on task"):
         """使用提示和分类头进行标准评估"""
         self.model.eval()
         test_data = self.test_loader[task]
@@ -736,7 +710,7 @@ class Client_DF:
         acc = 100 * correct / total
         print(f'{acc}')
 
-        self._log_accuracy(acc.item(), f"Local evaluation on task {task}", "Local Training", task_id=task)
+        self._log_accuracy(acc.item(), f"{notes_prefix} {task}", phase, task_id=task)
 
     def evaluate_with_global_head(self, task=0, nb_classes=None):
         """使用全局分类头进行评估（服务器聚合后）"""

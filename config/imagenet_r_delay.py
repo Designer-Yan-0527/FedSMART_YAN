@@ -176,11 +176,9 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--lambda_proto', default=0.3, type=float,
                             help='Proto replay 损失权重，CIFAR-100:0.20, ImageNet-R:0.30')
 
-    # -- Class-Aware Head Aggregation --
-    subparsers.add_argument('--use_class_aware_head_agg', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='是否启用类别感知分类头聚合（每个类只从学过的客户端聚合）')
-    subparsers.add_argument('--use_head_grad_mask', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='是否启用未见过类的分类头梯度掩码')
+    # -- Class-Aware Head Aggregation / Head Grad Mask --
+    # [已删除] use_class_aware_head_agg、use_head_grad_mask、use_fed_smr_aggregate
+    # 原始 FedTA 设计：vit.head 做全局 FedAvg，Tail Anchor model.head 做 per-task 快照
 
     # -- 已废弃/可选增强 --
     subparsers.add_argument('--use_soft_prompt', default=False, type=lambda x: (str(x).lower() == 'true'),
@@ -189,7 +187,5 @@ def get_args_parser(subparsers):
                             help='[已废弃] Top-K Sparse Softmax')
     subparsers.add_argument('--temperature_anneal', default=False, type=lambda x: (str(x).lower() == 'true'),
                             help='[已废弃] Temperature Annealing')
-    subparsers.add_argument('--use_fed_smr_aggregate', default=False, type=lambda x: (str(x).lower() == 'true'),
-                            help='[已废弃] 使用频率联邦加权聚合')
 
     
