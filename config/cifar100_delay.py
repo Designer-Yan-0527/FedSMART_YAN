@@ -133,7 +133,7 @@ def get_args_parser(subparsers):
     subparsers.add_argument('--surrogate_num', default=20, type=int, help='代理数据数量')
     subparsers.add_argument('--global_epoch', default=5, type=int, help='全局训练轮数')
     subparsers.add_argument('--local_epoch', default=30, type=int, help='本地训练轮数')
-    subparsers.add_argument('--threshold', default=0.15, type=float, help='相似度阈值')
+    subparsers.add_argument('--threshold', default=0.25, type=float, help='BGPS 原型选择相似度阈值（对齐官方硬编码值）')
     subparsers.add_argument('--data_name', default='cifar100', type=str, help='数据集名称')
     subparsers.add_argument('--model_name', default='Tail_Anchor', choices=['AlexNet', 'VGG16', 'ResNet18', 'SimpleCNN', 'Tail_Anchor'],
                             type=str, help='模型名称')

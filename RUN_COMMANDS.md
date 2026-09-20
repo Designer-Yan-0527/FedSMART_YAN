@@ -53,7 +53,7 @@
 | `--global_epoch` | 5 | 5 | |
 | `--local_epoch` | 30 | 30 | |
 | `--surrogate_num` | 20 | 5 | 服务器代理数据每类采样数 |
-| `--threshold` | 0.15 | 0.15 | BGPS 原型选择阈值 |
+| `--threshold` | 0.25 | 0.25 | BGPS 原型选择阈值（对齐官方） |
 | `--seed` | 42 | 42 | 建议 3 seeds: 42, 123, 2024 |
 
 ---
@@ -234,12 +234,12 @@ python main.py imagenet_r_delay --batch-size 16 --data-path ./local_datasets/ \
 
 ```
 L = L_CE
-  + λ_infonce · L_infonce              # SIKF 对比学习 (FedTA 原始)
-  - 0.1 · L_pull_off                   # 拉约束 (FedTA 原始)
-  + λ_route · L_route                  # E2+: 监督 Key 路由
-  + α_div · L_div(seen, margin)        # E3+: Seen-Only Diversity
+  + λ_cons · L_cons                     # FedTA 原始: global-prototype contrastive loss (InfoNCE)
+  - 0.1 · L_pull_off                    # FedTA 原始: 拉约束
+  + λ_route · L_route                   # E2+: 监督 Key 路由
+  + α_div · L_div(seen, margin)         # E3+: Seen-Only Diversity
   + α_tmp · (L_anchor_tmp + η·L_key_tmp)  # E3+: Key+Anchor Temporal
-  + λ_proto · L_proto_replay           # E4+: Prototype Head Replay (ablation)
+  + λ_proto · L_proto_replay            # E4+: Prototype Head Replay (ablation)
 ```
 
 ---

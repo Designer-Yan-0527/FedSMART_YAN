@@ -119,7 +119,7 @@ class Server_DF(object):
         - 基线: FedTA_Baseline_{dataset}.csv
         - A: Anchor_Softmax{T}_gamma{G}_{dataset}.csv
         - A+B: Anchor_Softmax{T}_gamma{G}_MSP{D}_{T}_{dataset}.csv
-        - 加后缀: _Route, _CA (Class-Aware), _Proto
+        - 加后缀: _Route, _Proto, _SeenRoute
         """
         parts = []
         dataset = getattr(self.args, 'data_name', 'unknown')
@@ -193,16 +193,16 @@ class Server_DF(object):
                 ))
         print("Initialization completes")
 
-    def fedavg(self, sample_nums, use_usage_weights=False):
+    def fedavg(self, sample_nums):
         """
-        对客户端模型执行联邦平均（FedAvg）
+        标准联邦平均（FedAvg）
 
-        FedSMR: 当 use_usage_weights=True 时，使用记忆使用频率加权聚合，
-        高频使用的记忆向量获得更高的聚合权重。
+        Legacy helper; unused in FedTA/FedSMR main training path.
+        主训练路径通过 SIKF + BGPS + vit.head FedAvg 进行服务器聚合，
+        不对 Tail Anchor 的 key/anchor/head 做联邦平均。
 
         Args:
             sample_nums: 每个客户端的样本数量列表
-            use_usage_weights: 是否使用 FedSMR 使用频率加权聚合
 
         Returns:
             平均后的模型参数（state_dict）
@@ -210,55 +210,15 @@ class Server_DF(object):
         training_num = sum(sample_nums)
         averaged_params = self.clients[0].model.cpu().state_dict()
 
-        if use_usage_weights:
-            # FedSMR: 使用频率加权聚合
-            # 收集所有客户端的 anchor 使用频率
-            all_anchor_usages = []
+        for k in averaged_params.keys():
             for i in range(self.client_num):
-                usage = self.clients[i].get_anchor_usage()
-                if usage is not None:
-                    all_anchor_usages.append(usage)
+                local_sample_number = sample_nums[i]
+                local_model_params = self.clients[i].model.cpu().state_dict()
+                w = local_sample_number / training_num
+                if i == 0:
+                    averaged_params[k] = local_model_params[k] * w
                 else:
-                    all_anchor_usages.append(torch.ones(self.args.nb_classes))
-
-            # 对 anchor_pool 使用频率加权聚合
-            for k in averaged_params.keys():
-                if 'anchor_pool' in k:
-                    for i in range(self.client_num):
-                        local_model_params = self.clients[i].model.cpu().state_dict()
-                        usage = all_anchor_usages[i].to(averaged_params[k].device)
-                        # 归一化使用频率作为权重
-                        usage_norm = usage / (usage.sum() + 1e-8)
-                        # 将使用频率广播到与 anchor_pool 相同的维度
-                        # anchor_pool shape: (nb_class, key_size)
-                        usage_expanded = usage_norm.unsqueeze(-1).expand_as(averaged_params[k])
-                        if i == 0:
-                            averaged_params[k] = local_model_params[k] * usage_expanded
-                        else:
-                            averaged_params[k] += local_model_params[k] * usage_expanded
-                    # 按客户端数量归一化
-                    averaged_params[k] = averaged_params[k] / self.client_num
-                else:
-                    # 其他参数使用标准 FedAvg
-                    for i in range(self.client_num):
-                        local_sample_number = sample_nums[i]
-                        local_model_params = self.clients[i].model.cpu().state_dict()
-                        w = local_sample_number / training_num
-                        if i == 0:
-                            averaged_params[k] = local_model_params[k] * w
-                        else:
-                            averaged_params[k] += local_model_params[k] * w
-        else:
-            # 标准 FedAvg
-            for k in averaged_params.keys():
-                for i in range(self.client_num):
-                    local_sample_number = sample_nums[i]
-                    local_model_params = self.clients[i].model.cpu().state_dict()
-                    w = local_sample_number / training_num
-                    if i == 0:
-                        averaged_params[k] = local_model_params[k] * w
-                    else:
-                        averaged_params[k] += local_model_params[k] * w
+                    averaged_params[k] += local_model_params[k] * w
 
         return averaged_params
 

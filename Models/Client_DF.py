@@ -585,11 +585,6 @@ class Client_DF:
 
         self.prompts = deepcopy(self.vit.get_prompts())
 
-    def load_global_weights(self, weights):
-        """加载全局模型权重并评估"""
-        self.model.load_state_dict(weights)
-        self.evaluate(self.task_id, self.nb_classes)
-
     def get_global_proto_and_head(self, proto, head, prompt, round_num):
         """更新全局原型、分类头和提示，然后进行评估"""
         self.global_protos = deepcopy(proto)
@@ -711,46 +706,6 @@ class Client_DF:
         print(f'{acc}')
 
         self._log_accuracy(acc.item(), f"{notes_prefix} {task}", phase, task_id=task)
-
-    def evaluate_with_global_head(self, task=0, nb_classes=None):
-        """使用全局分类头进行评估（服务器聚合后）"""
-        self.model.eval()
-        test_data = self.test_loader[task]
-        test_loader = DataLoader(test_data, batch_size=8, shuffle=True)
-        correct = 0
-        total = 0
-
-        # P0.4 FIX: 加载 global head，不是 local task head
-        if self.global_head is not None:
-            self.model.load_head(deepcopy(self.global_head))
-        self.model.to(self.device)
-
-        for input, target in test_loader:
-            input = input.to(self.device, non_blocking=True)
-            target = target.to(self.device, non_blocking=True)
-
-            with torch.no_grad():
-                if self.original_model is not None:
-                    output = self.original_model(input)
-                    output = output['pre_logits'].requires_grad_(False)
-                    output = self.vit(input, task_id=self.task_id, cls_features=output, train=True)
-                    pre, _, _, _, _, _ = self.model(output['feat'].to(self.device), target.to(self.device))
-
-            logits = pre
-
-            mask = self.class_mask[task]
-            not_mask = np.setdiff1d(np.arange(nb_classes), mask)
-            not_mask = torch.tensor(not_mask, dtype=torch.int64).to(self.device)
-            logits = logits.index_fill(dim=1, index=not_mask, value=float('-inf'))
-
-            predicts = torch.max(logits, dim=1)[1].cpu()
-            correct += (predicts == target.cpu()).sum()
-            total += len(target)
-
-        acc = 100 * correct / total
-        print(f'Global Head Evaluation: {acc}')
-
-        self._log_accuracy(acc.item(), f"Global head evaluation on task {task}", "Server Aggregation", task_id=task)
 
     def evaluate_cosin_similarity(self, task=0, nb_classes=None):
         """使用全局原型的余弦相似度进行评估"""
@@ -953,39 +908,6 @@ class Client_DF:
         else:
             self.evaluate(0, self.nb_classes)
             self.evaluate(self.task_id, self.nb_classes)
-
-    def evaluate_on_global_testset(self, testdata):
-        """在全局测试数据集上进行评估"""
-        test_loader = DataLoader(testdata, batch_size=16, shuffle=True, num_workers=2)
-
-        self.vit.load_head(self.global_head)
-        self.vit.to(self.device)
-
-        correct = 0
-        total = 0
-
-        for input, target in test_loader:
-            input = input.to(self.device, non_blocking=True)
-            target = target.to(self.device, non_blocking=True)
-
-            with torch.no_grad():
-                if self.original_model is not None:
-                    output = self.original_model(input)
-                    output = output['pre_logits'].requires_grad_(False)
-                    output = self.vit(input, task_id=self.task_id, cls_features=output, train=True)
-                    _, _, _, _, _, _ = self.model(output['feat'].to(self.device), target.to(self.device))
-
-                output = self.head(output['feat'])
-
-            logits = output
-            predicts = torch.max(logits, dim=1)[1].cpu()
-            correct += (predicts == target.cpu()).sum()
-            total += len(target)
-
-        acc = 100 * correct / total
-        print(f'{acc}')
-
-        self._log_accuracy(acc.item(), "Global test set evaluation", "Global Test", task_id=self.task_id)
 
     def get_anchor_usage(self):
         """获取 anchor 使用频率统计（FedSMR: 供联邦聚合使用）"""

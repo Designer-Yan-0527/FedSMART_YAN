@@ -63,8 +63,8 @@ for round 0..24:  # 5 tasks × 5 global_epochs
      c. vit.head FedAvg — Input Enhancement 分类头联邦平均
 
   3. 分发全局模型给客户端:
-     - global_protos[class] → 客户端 InfoNCE 对比学习
-     - global_head (vit.head) → 客户端 Input Enhancement
+     - global_protos[class] → 客户端 L_cons 对比学习 (InfoNCE)
+     - global_head (vit.head FedAvg 结果) → 仅存储/分发，不 load 到 vit 也不 load 到 model.head
      - fused_prompt → 客户端 Prompt 初始化
 ```
 
@@ -86,7 +86,7 @@ logits = classification_head(feat_mixed)
 ### 1.5 损失函数 (FedTA 原始)
 
 ```
-L = L_CE + λ_spatial·L_pull_off + λ_sikf·L_infonce
+L = L_CE + λ_spatial·L_pull_off + λ_cons·L_cons
 ```
 
 ---
@@ -178,12 +178,15 @@ L_route = CE(softmax(similarity[:, seen]/τ_route), target)
 
 ```
 L_total = L_CE
-        + 0.2·task_per_epoch·L_infonce       # FedTA 原始: SIKF 对比学习
-        - 0.1·L_pull_off                      # FedTA 原始: 拉约束
-        + λ_route·L_route                     # FedSMR enhancement: 监督路由
-        + α_div·L_div(seen, margin)           # FedSMR core: Seen-Only Diversity
-        + α_tmp·(L_anchor_tmp + η·L_key_tmp)  # FedSMR core: Key+Anchor Temporal
+        + 0.2·task_per_epoch·L_cons         # FedTA 原始: global-prototype contrastive loss (InfoNCE)
+        - 0.1·L_pull_off                     # FedTA 原始: 拉约束
+        + λ_route·L_route                    # FedSMR enhancement: 监督路由
+        + α_div·L_div(seen, margin)          # FedSMR core: Seen-Only Diversity
+        + α_tmp·(L_anchor_tmp + η·L_key_tmp) # FedSMR core: Key+Anchor Temporal
 ```
+
+注: FedTA 论文中 L_cons (Eq.5-6) 是客户端使用 BGPS 全局原型进行的对比学习，
+与 SIKF (Eq.7-8) 是服务器代理数据上的知识蒸馏 (L_KD)，两者是不同的机制。
 
 ---
 
@@ -235,9 +238,31 @@ FedSTAR/
 | `fed_avg_head()` 聚合对象 | `vit.head` | `vit.head` | ✅ 已对齐 |
 | `model.head` 管理 | per-task `heads[task]` 快照 | per-task `heads[task]` 快照 | ✅ 已对齐 |
 | `evaluate()` 使用 | `model.load_head(heads[task])` | `model.load_head(heads[task])` | ✅ 已对齐 |
-| `global_head` 加载 | 不分发给 model.head | 不分发给 model.head | ✅ 已对齐 |
+| `global_head` 分发 | 仅存储/分发，不 load 到 vit 或 model.head | 仅存储/分发，不 load 到 vit 或 model.head | ✅ 已对齐 |
 | Tail Anchor 全模型聚合 | 不做 | 不做 | ✅ 已对齐 |
-| SIKF (prompt fusion) | ✅ | ✅ | ✅ 保留 |
-| BGPS (prototype selection) | ✅ | ✅ | ✅ 保留 |
+| SIKF (prompt KD fusion) | ✅ | ✅ | ✅ 保留 |
+| BGPS (prototype selection, threshold=0.25) | ✅ | ✅ | ✅ 已对齐 |
 | `choose_best_proto_greedy_similarity_fixed_key()` | ✅ | ✅ | ✅ 保留 |
 | `kd_fusion_prompt()` | ✅ | ✅ | ✅ 保留 |
+
+---
+
+## 七、与官方代码的已知差异（有意修正）
+
+### Chead 输出维度
+
+| | 官方 FedTA | 本实现 | 影响 |
+|---|---|---|---|
+| `Chead(nb_class)` | 硬编码 `Chead(200)` | `Chead(args.nb_classes)` | CIFAR-100: 200→100; ImageNet-R: 200 (无变化) |
+
+**原因**: 官方代码对所有数据集固定输出 200 类，在 CIFAR-100 (100 类) 上浪费了 100 个未使用维度。
+本修正对 FedTA baseline 和 FedSMR 统一应用，属于公平的 bug fix。
+
+### BGPS 选择阈值
+
+| | 官方 FedTA | 本实现 |
+|---|---|---|
+| `threshold` | `train_clients()` 硬编码 `threshold=0.25` | config 默认 `0.25` |
+
+**原因**: 官方 config 默认值 `0.15` 未被主训练路径实际使用（`train_clients()` 内硬编码 `0.25`）。
+本实现统一使用 `0.25` 以对齐官方实际运行行为。
