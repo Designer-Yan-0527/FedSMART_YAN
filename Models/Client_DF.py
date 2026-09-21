@@ -121,6 +121,9 @@ class Client_DF:
         self.seen_classes = set()
         self.old_seen_classes = set()
 
+        # E1-Repair v1: per-task hard anchor usage tracking (诊断用)
+        self.task_anchor_usage = {}
+
         # 自适应: 是否有公共类
         total_private = args.client_num * args.private_class_num
         self._has_public_classes = (max(0, args.nb_classes - total_private) > 0)
@@ -453,6 +456,33 @@ class Client_DF:
         self.model.train()  # usage 只在训练模式累积
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=1e-3)
 
+        # =============================================================
+        # E1-Repair v1 diagnostics: sample-weighted accumulation
+        # =============================================================
+        task_hard_usage = torch.zeros(self.nb_classes, device=self.device)
+
+        diag_sample_count = 0
+        diag_old_mass_sum = 0.0
+        diag_hard_collision_sum = 0.0
+        diag_entropy_sum = 0.0
+        diag_max_weight_sum = 0.0
+
+        old_anchor_idx = None
+        t0_topk_coverage = None
+
+        if self.task_id >= 1 and self.use_soft_anchor:
+            usage_t0 = self.task_anchor_usage.get(0)
+            if usage_t0 is not None and usage_t0.sum().item() > 0:
+                usage_t0_dev = usage_t0.to(self.device)
+                num_used = int((usage_t0_dev > 0).sum().item())
+                k = min(8, num_used)
+                if k > 0:
+                    old_anchor_idx = torch.topk(usage_t0_dev, k=k).indices
+                    t0_topk_coverage = (
+                        usage_t0_dev[old_anchor_idx].sum()
+                        / usage_t0_dev.sum().clamp_min(1e-12)
+                    ).item()
+
         for epoch in tqdm(range(self.local_epoch)):
             for input, target in train_loader:
                 input = Variable(input, requires_grad=False).to(
@@ -474,6 +504,26 @@ class Client_DF:
                     global_step=global_step, total_steps=total_steps * 2
                 )
                 logits = pre
+
+                # E1-Repair v1: sample-weighted routing diagnostics
+                task_hard_usage += torch.bincount(hard_idx, minlength=self.nb_classes).float()
+
+                if self.use_soft_anchor:
+                    attn_det = attn_weights.detach()
+                    hard_det = hard_idx.detach()
+                    bs = hard_det.size(0)
+
+                    clamped = attn_det.clamp_min(1e-12)
+                    diag_entropy_sum += -(clamped * torch.log(clamped)).sum(dim=1).sum().item()
+                    diag_max_weight_sum += attn_det.max(dim=1).values.sum().item()
+
+                    if old_anchor_idx is not None:
+                        diag_old_mass_sum += attn_det[:, old_anchor_idx].sum().item()
+                        diag_hard_collision_sum += torch.isin(
+                            hard_det, old_anchor_idx
+                        ).float().sum().item()
+
+                    diag_sample_count += bs
 
                 # Calculate InfoNCE loss if global prototypes exist
                 if self.global_protos is None:
@@ -534,6 +584,36 @@ class Client_DF:
                 optimizer.step()
 
                 global_step += 1
+
+        # =============================================================
+        # Save hard-anchor usage across global rounds
+        # =============================================================
+        round_usage = task_hard_usage.detach().cpu()
+
+        if self.task_id not in self.task_anchor_usage:
+            self.task_anchor_usage[self.task_id] = round_usage.clone()
+        else:
+            self.task_anchor_usage[self.task_id] += round_usage
+
+        # =============================================================
+        # E1 routing diagnostics (sample-weighted summary)
+        # =============================================================
+        if self.task_id >= 1 and self.use_soft_anchor and diag_sample_count > 0:
+            entropy = diag_entropy_sum / diag_sample_count
+            max_weight = diag_max_weight_sum / diag_sample_count
+
+            if old_anchor_idx is not None:
+                old_anchor_mass = diag_old_mass_sum / diag_sample_count
+                hard_collision = diag_hard_collision_sum / diag_sample_count
+
+                print(f"[E1-Diag] client={self.id} task={self.task_id} "
+                      f"T0_top8_coverage={t0_topk_coverage:.4f} "
+                      f"T0_anchor_mass={old_anchor_mass:.4f} "
+                      f"hard_collision={hard_collision:.4f} "
+                      f"entropy={entropy:.4f} max_w={max_weight:.4f}")
+            else:
+                print(f"[E1-Diag] client={self.id} task={self.task_id} "
+                      f"entropy={entropy:.4f} max_w={max_weight:.4f}")
 
         # Extract local prototypes from training data
         self.model.eval()  # 评估/原型提取不累积 usage
@@ -680,6 +760,10 @@ class Client_DF:
         self.model.load_head(self.heads[task])
         self.model.to(self.device)
 
+        # E1-Repair v1: paired hard-eval 诊断（仅评估旧任务时）
+        do_hard_diag = (self.use_soft_anchor and task < self.task_id)
+        hard_correct = 0
+
         for input, target in test_loader:
             input = input.to(self.device, non_blocking=True)
             target = target.to(self.device, non_blocking=True)
@@ -689,8 +773,21 @@ class Client_DF:
                     output = self.original_model(input)
                     output = output['pre_logits'].requires_grad_(False)
                     output = self.vit(input, task_id=self.task_id, cls_features=output, train=True)
-                    pre, _, _, _, _, _ = self.model(output['feat'].to(self.device), target.to(self.device))
+                    feat = output['feat'].to(self.device)
 
+                # 正常 E1 soft inference
+                pre, _, _, _, _, _ = self.model(feat, target.to(self.device))
+
+                # Paired hard inference (同一 batch, 同一 ViT feature, 同一 head)
+                if do_hard_diag:
+                    original_flag = self.model.soft_anchor
+                    try:
+                        self.model.soft_anchor = False
+                        pre_hard, _, _, _, _, _ = self.model(feat, target.to(self.device))
+                    finally:
+                        self.model.soft_anchor = original_flag
+
+            # Soft accuracy
             logits = pre
 
             mask = self.class_mask[task]
@@ -702,8 +799,19 @@ class Client_DF:
             correct += (predicts == target.cpu()).sum()
             total += len(target)
 
+            # Hard accuracy (paired diagnostic)
+            if do_hard_diag:
+                logits_hard = pre_hard.index_fill(dim=1, index=not_mask, value=float('-inf'))
+                predicts_hard = torch.max(logits_hard, dim=1)[1].cpu()
+                hard_correct += (predicts_hard == target.cpu()).sum()
+
         acc = 100 * correct / total
-        print(f'{acc}')
+        print(f'Soft acc: {acc}')
+
+        if do_hard_diag:
+            hard_acc = 100 * hard_correct / total
+            print(f"[E1-Diag] Client {self.id}, Task {task}: "
+                  f"soft={acc.item():.2f}%, hard={hard_acc.item():.2f}%")
 
         self._log_accuracy(acc.item(), f"{notes_prefix} {task}", phase, task_id=task)
 

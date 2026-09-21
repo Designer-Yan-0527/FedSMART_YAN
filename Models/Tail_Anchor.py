@@ -80,21 +80,29 @@ class Tail_Anchor(nn.Module):
     def forward(self, x, class_mask, global_step=None, total_steps=None):
         """
         Returns: logits, output_mixed, reduce_sim, anchor_feat, attn_weights, hard_idx
+
+        E1-Repair v1:
+        - reduce_sim always uses hard key (restores FedTA baseline pull loss)
+        - soft anchor uses stop-gradient residual: hard + γ·sg(soft-hard)
+        - forward values identical to before; backward only updates hard_anchor
         """
+        # ---- 1. similarity ----
         x_embed_norm = self.l2_normalize(x, dim=1)
         key_norm = self.l2_normalize(self.key.reshape(-1, self.key_size), dim=1).to(x.device)
         similarity = torch.matmul(x_embed_norm, key_norm.t())
 
-        # P1.5 FIX: raw anchor_pool for feature mixing (not normalized)
         anchor_pool_raw = self.anchor_pool.reshape(-1, self.key_size).to(x.device)
 
-        # 建议11: seen-class routing
+        # ---- 2. Hard routing (FedTA baseline path, always active) ----
         routing_sim = self._get_routing_similarity(similarity)
-
-        # === Hard Anchor (argmax) — raw anchor, preserves FedTA baseline when γ=0 ===
         hard_idx = routing_sim.argmax(dim=1)
         hard_anchor = anchor_pool_raw[hard_idx]
 
+        # ---- 3. Hard-key pull (same as FedTA baseline regardless of soft_anchor) ----
+        batched_key_norm = key_norm[hard_idx]
+        reduce_sim = torch.sum(x_embed_norm * batched_key_norm.squeeze(1)) / self.key_size
+
+        # ---- 4. E1: Residual Soft Anchor (stop-gradient on residual) ----
         if self.soft_anchor:
             temp = self.compute_temperature(global_step, total_steps)
             attn_logits = routing_sim / temp
@@ -108,13 +116,14 @@ class Tail_Anchor(nn.Module):
             else:
                 soft_attn = torch.softmax(attn_logits, dim=1)
 
-            # P1.5 FIX: soft_anchor uses raw anchor_pool
             soft_anchor = torch.matmul(soft_attn, anchor_pool_raw)
 
-            # Residual Soft-Anchor
-            anchor_feat = (1 - self.soft_anchor_ratio) * hard_anchor + self.soft_anchor_ratio * soft_anchor
+            # CRITICAL: stop-gradient on residual
+            # Forward:  hard + γ·(soft-hard) ≡ (1-γ)·hard + γ·soft  (identical)
+            # Backward: only hard_anchor receives CE gradient; soft branch detached
+            soft_residual = (soft_anchor - hard_anchor).detach()
+            anchor_feat = hard_anchor + self.soft_anchor_ratio * soft_residual
 
-            # Hard usage (training only, 不被评估/原型提取污染)
             if self.training:
                 hard_batch_usage = torch.bincount(hard_idx, minlength=self.nb_class).float().detach()
                 self.anchor_hard_usage += hard_batch_usage.to(self.anchor_hard_usage.device)
@@ -122,9 +131,9 @@ class Tail_Anchor(nn.Module):
                 self.anchor_usage += soft_batch_usage.to(self.anchor_usage.device)
 
             attn_weights = soft_attn
-            reduce_sim = torch.sum(x_embed_norm * torch.matmul(attn_weights, key_norm)) / self.key_size
+
         else:
-            # Hard Anchor only (FedTA baseline when soft_anchor_ratio=0)
+            # Hard Anchor only (FedTA baseline when soft_anchor=False)
             anchor_feat = hard_anchor
 
             if self.training:
@@ -136,9 +145,7 @@ class Tail_Anchor(nn.Module):
             if self.training:
                 self.anchor_usage += attn_weights.sum(dim=0).detach().to(self.anchor_usage.device)
 
-            batched_key_norm = key_norm[hard_idx]
-            reduce_sim = torch.sum(x_embed_norm * batched_key_norm.squeeze(1)) / self.key_size
-
+        # ---- 5. classifier ----
         output_mixed = torch.stack((x, anchor_feat), dim=1).view(-1, self.key_size * 2)
         logits = self.head(output_mixed)
 
